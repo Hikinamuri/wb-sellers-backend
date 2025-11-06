@@ -1,0 +1,444 @@
+import os
+import json
+import asyncio
+from dotenv import load_dotenv
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, PreCheckoutQueryHandler
+from new_parser import parse_wb_product_api
+import aiohttp
+from telegram import LabeledPrice
+from telegram.ext import PreCheckoutQueryHandler
+
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+WEB_APP_URL = "https://wb-seller.vercel.app/"
+BACKEND_URL = "http://localhost:8000"
+SUPPORT_USERNAME = "@Hikinamuri"
+CHANNEL_ID = '@wbsellers_test'
+# Кэш для хранения результатов парсинга
+parsing_cache = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    tg_id = user.id
+
+    registered = await is_user_registered(tg_id)
+
+    if registered:
+        # ✅ Уже зарегистрирован — показываем WebApp с tg_id в URL
+        keyboard = [
+            [
+                KeyboardButton(
+                    text="📱 Открыть приложение",
+                    web_app=WebAppInfo(url=f"{WEB_APP_URL}?tg_id={tg_id}")
+                )
+            ],
+            [KeyboardButton("🛠 Тех. поддержка")]
+        ]
+        greeting = (
+            f"Привет, {user.first_name}! 👋\n\n"
+            "Добро пожаловать обратно! Вы можете открыть приложение для работы с товарами 👇"
+        )
+    else:
+        # ❌ Не зарегистрирован — только кнопка для контакта
+        keyboard = [
+            [KeyboardButton(text="📞 Поделиться контактом", request_contact=True)],
+            [KeyboardButton("🛠 Тех. поддержка")]
+        ]
+        greeting = (
+            f"Привет, {user.first_name}! 👋\n\n"
+            "Я бот для автоматической выкладки товаров на Wildberries.\n\n"
+            "Для начала, пожалуйста, поделитесь контактом, чтобы зарегистрироваться 👇"
+        )
+
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(greeting, parse_mode="HTML", reply_markup=reply_markup)
+
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка shared контакта"""
+    contact = update.message.contact
+    user = update.effective_user
+
+    print(f"📞 Получен контакт: {contact.phone_number} от пользователя {user.id}")
+
+    # Отправляем данные на бэкенд для регистрации
+    payload = {
+        "tg_id": user.id,
+        "name": user.first_name,
+        "phone": contact.phone_number,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{BACKEND_URL}/api/users/register", json=payload) as resp:
+                result = await resp.json()
+
+        if result.get("success"):
+            await update.message.reply_text(
+                f"✅ Спасибо, {user.first_name}! Вы успешно зарегистрированы.\n\n"
+                "Теперь можете открыть приложение 👇",
+                reply_markup=await get_main_keyboard(user.id),
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Ошибка при регистрации. Попробуйте позже."
+            )
+            print("Ошибка при регистрации:", result)
+
+    except Exception as e:
+        print(f"❌ Ошибка при обращении к бэкенду: {e}")
+        await update.message.reply_text("⚠️ Не удалось сохранить контакт в БД.")
+
+async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка данных из Web App"""
+    if update.message.web_app_data:
+        try:
+            data = json.loads(update.message.web_app_data.data)
+            print(f"📦 Данные из Web App: {data}")
+            
+            # Обработка разных типов действий из Web App
+            action = data.get('action')
+            
+            if action == 'create_order':
+                await update.message.reply_text(
+                    "✅ Заказ создан! Товар добавлен в очередь на выкладку.\n\n"
+                    f"🛍️ Товар: {data.get('product_name', 'N/A')}\n"
+                    f"📅 Дата выкладки: {data.get('scheduled_date', 'N/A')}\n"
+                    f"💰 Сумма: {data.get('amount', 'N/A')} руб."
+                )
+            elif action == 'repeat_order':
+                await update.message.reply_text("🔄 Заказ повторен и добавлен в очередь!")
+            elif action == 'parse_product':
+                # Обработка запроса на парсинг
+                product_url = data.get('product_url')
+                if product_url:
+                    await handle_product_parsing(update, product_url)
+            else:
+                await update.message.reply_text("✅ Данные получены!")
+                
+        except Exception as e:
+            print(f"❌ Ошибка обработки данных: {e}")
+            await update.message.reply_text("❌ Ошибка обработки данных от приложения")
+
+async def handle_product_parsing(update: Update, product_url: str):
+    """Обработка парсинга товара через API Wildberries"""
+    try:
+        # Отправляем сообщение о начале парсинга
+        parsing_msg = await update.message.reply_text("🔍 Парсим информацию о товаре через API...")
+        
+        # Используем API парсер
+        product_data = await parse_wb_product_api(product_url)
+        
+        if product_data.get('success'):
+            # Форматируем сообщение с реальными данными
+            message = format_api_product_message(product_data)
+            await parsing_msg.edit_text(message, parse_mode='HTML')
+            
+            # Сохраняем в кэш для использования в приложении
+            cache_key = f"product_{update.effective_user.id}"
+            parsing_cache[cache_key] = product_data
+            
+        else:
+            await parsing_msg.edit_text(
+                f"❌ Не удалось получить информацию о товаре\n\n"
+                f"Ошибка: {product_data.get('error', 'Неизвестная ошибка')}\n"
+                f"Проверьте ссылку и попробуйте снова."
+            )
+            
+    except Exception as e:
+        print(f"❌ Ошибка при парсинге: {e}")
+        await update.message.reply_text(
+            "❌ Произошла ошибка при получении информации о товаре"
+        )
+
+def format_api_product_message(product_data: dict) -> str:
+    """Форматирование сообщения с реальными данными из API"""
+    name = product_data.get('name', 'Неизвестно')
+    price = product_data.get('price', 0)
+    brand = product_data.get('brand', 'Неизвестно')
+    rating = product_data.get('rating', 0)
+    feedbacks = product_data.get('feedbacks', 0)
+    supplier = product_data.get('supplier', 'Неизвестно')
+    discount = product_data.get('discount', 0)
+    basic_price = product_data.get('basic_price')
+    
+    message = (
+        f"🛍️ <b>Информация о товаре</b>\n\n"
+        f"<b>Название:</b> {name}\n"
+        f"<b>Бренд:</b> {brand}\n"
+        f"<b>Продавец:</b> {supplier}\n"
+    )
+    
+    if discount > 0 and basic_price:
+        message += f"<b>Цена:</b> <s>{basic_price} руб.</s> <b>{price} руб.</b> (-{discount}%)\n"
+    else:
+        message += f"<b>Цена:</b> {price} руб.\n"
+    
+    if rating > 0:
+        message += f"<b>Рейтинг:</b> {rating} ⭐\n"
+    
+    if feedbacks > 0:
+        message += f"<b>Отзывов:</b> {feedbacks}\n"
+    
+    description = product_data.get('description', '')
+    if description and len(description) > 10:
+        message += f"\n<b>Описание:</b>\n{description[:200]}..."
+    
+    # Добавляем характеристики
+    characteristics = product_data.get('characteristics', {})
+    if characteristics:
+        message += f"\n\n<b>Характеристики:</b>"
+        for key, value in list(characteristics.items())[:2]:
+            message += f"\n• {key}: {value}"
+    
+    message += f"\n\n<b>Артикул:</b> {product_data.get('articul', 'N/A')}"
+    
+    return message
+
+def format_product_message(product_data: dict) -> str:
+    """Форматирование сообщения с информацией о товаре"""
+    name = product_data.get('name', 'Неизвестно')
+    price = product_data.get('price', 0)
+    description = product_data.get('description', 'Описание отсутствует')
+    rating = product_data.get('rating', 0)
+    reviews_count = product_data.get('reviews_count', 0)
+    seller = product_data.get('seller', 'Неизвестно')
+    
+    message = (
+        f"🛍️ <b>Информация о товаре</b>\n\n"
+        f"<b>Название:</b> {name}\n"
+        f"<b>Цена:</b> {price} руб.\n"
+        f"<b>Продавец:</b> {seller}\n"
+    )
+    
+    if rating > 0:
+        message += f"<b>Рейтинг:</b> {rating} ⭐\n"
+    
+    if reviews_count > 0:
+        message += f"<b>Отзывы:</b> {reviews_count}\n"
+    
+    message += f"\n<b>Описание:</b>\n{description[:300]}..."
+    
+    # Добавляем характеристики если они есть
+    characteristics = product_data.get('characteristics', {})
+    if characteristics:
+        message += f"\n\n<b>Основные характеристики:</b>"
+        for key, value in list(characteristics.items())[:3]:  # Показываем первые 3
+            message += f"\n• {key}: {value}"
+    
+    return message
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        print("⚠️ Обновление без текстового сообщения — пропускаем")
+        return
+
+    text = update.message.text
+    user_id = update.effective_user.id
+
+    # Проверяем, зарегистрирован ли пользователь
+    async def is_user_registered(tg_id: int) -> bool:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{BACKEND_URL}/api/users/{tg_id}") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("exists", False)
+        except Exception as e:
+            print(f"⚠️ Ошибка проверки пользователя: {e}")
+        return False
+
+    if text == "📱 Открыть приложение":
+        print(f"🔗 Пользователь {user_id} пытается открыть Web App")
+
+        # Проверяем регистрацию
+        registered = await is_user_registered(user_id)
+        if not registered:
+            await update.message.reply_text(
+                "⚠️ Сначала поделитесь контактом для регистрации!\n\n"
+                "Нажмите кнопку <b>📞 Поделиться контактом</b> ниже 👇",
+                parse_mode='HTML'
+            )
+            return  # ❌ Прерываем выполнение, не открываем WebApp
+
+        # ✅ Пользователь зарегистрирован — разрешаем
+        await update.message.reply_text(
+            "✅ Отлично! Можете открыть приложение 👇",
+            reply_markup=await get_main_keyboard(user_id)
+        )
+
+        return
+
+    if text == "🛠 Тех. поддержка":
+        await update.message.reply_text(
+            f"📞 По всем вопросам обращайтесь: {SUPPORT_USERNAME}\n\n"
+            "Мы поможем с:\n"
+            "• Настройкой бота\n"
+            "• Проблемами с выкладкой\n"
+            "• Оплатой и возвратами\n"
+            "• Техническими вопросами"
+        )
+
+    else:
+        await update.message.reply_text(
+            "Используйте кнопки для управления 👇",
+            reply_markup=await get_main_keyboard()
+        )
+
+async def is_user_registered(tg_id: int) -> bool:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{BACKEND_URL}/api/users/{tg_id}") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("exists", False)
+    except Exception as e:
+        print(f"⚠️ Ошибка проверки пользователя: {e}")
+    return False
+
+async def get_main_keyboard(user_id: int):
+    web_app_button = KeyboardButton(
+        text="📱 Открыть приложение",
+        web_app=WebAppInfo(url=f"{WEB_APP_URL}?tg_id={user_id}")  # ✅ tg_id добавлен в URL
+    )
+    keyboard = [
+        [web_app_button],
+        [KeyboardButton("🛠 Тех. поддержка")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# Функция для получения данных парсинга (для API)
+def get_parsed_product(user_id: int) -> dict:
+    """Получение результатов парсинга для пользователя"""
+    return parsing_cache.get(f"product_{user_id}")
+
+async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка данных из Web App"""
+    if not update.message.web_app_data:
+        return
+
+    try:
+        data = json.loads(update.message.web_app_data.data)
+        print(f"📦 Данные из Web App: {data}")
+
+        # Если это данные для оплаты — создаём инвойс
+        if data.get("success") and "prices" in data:
+            prices = [LabeledPrice(**p) for p in data["prices"]]
+            context.user_data["pending_order_meta"] = data.get("metadata")
+
+            await update.message.reply_invoice(
+                title=data["title"],
+                description=data["description"],
+                payload=data["payload"],
+                provider_token="381764678:TEST:150197",
+                currency=data["currency"],
+                prices=prices,
+                start_parameter="publish",
+                need_name=True,
+                need_phone_number=True,
+            )
+            return  # выходим, чтобы не шло в другие блоки
+
+        # Старый код (оставляем для парсинга и прочих событий)
+        action = data.get('action')
+
+        if action == 'create_order':
+            await update.message.reply_text(
+                f"✅ Заказ создан!\n"
+                f"🛍️ {data.get('product_name', 'N/A')}\n"
+                f"📅 {data.get('scheduled_date', 'N/A')}\n"
+                f"💰 {data.get('amount', 'N/A')} руб."
+            )
+
+        elif action == 'parse_product':
+            product_url = data.get('product_url')
+            if product_url:
+                await handle_product_parsing(update, product_url)
+
+        else:
+            await update.message.reply_text("✅ Данные получены!")
+
+    except Exception as e:
+        print(f"❌ Ошибка обработки WebApp данных: {e}")
+        await update.message.reply_text("❌ Ошибка обработки данных от приложения")
+
+async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
+    print(f"💸 Успешная оплата: {payment.to_dict()}")
+
+    payload = payment.invoice_payload
+
+    # теперь достанем metadata из контекста или базы
+    # если ты отправлял JSON в payload — можно сделать:
+    # meta = json.loads(payload)
+    # но в твоём случае payload = "order_..."
+    # поэтому лучше хранить metadata в боте при отправке инвойса
+
+    # Для простоты: добавь metadata в поле context.user_data перед reply_invoice
+    meta = context.user_data.get("pending_order_meta")
+
+    if not meta:
+        await update.message.reply_text("⚠️ Не удалось получить данные о заказе.")
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{BACKEND_URL}/api/products/add",
+                json={
+                    "user_id": meta.get("user_id"),
+                    "url": meta.get("url"),
+                    "name": meta.get("name"),
+                    "description": meta.get("description"),
+                    "image_url": meta.get("image_url"),
+                    "price": float(meta.get("price") or 0),
+                    "scheduled_date": meta.get("scheduled_date"),
+                },
+            ) as resp:
+                result = await resp.json()
+                print(f"📦 Ответ от /api/products/add: {result}")
+
+        if result.get("success"):
+            await update.message.reply_text("✅ Оплата получена! Товар добавлен в очередь на выкладку.")
+        else:
+            await update.message.reply_text(f"⚠️ Оплата успешна, но не удалось добавить товар: {result.get('error')}")
+
+    except Exception as e:
+        print(f"❌ Ошибка при добавлении товара после оплаты: {e}")
+        await update.message.reply_text("❌ Ошибка при добавлении товара в базу.")
+
+    
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    try:
+        # Здесь можно проверить, корректен ли заказ, цена, payload и т.д.
+        await query.answer(ok=True)
+        print(f"✅ PreCheckout подтверждён: {query.invoice_payload}")
+    except Exception as e:
+        print(f"❌ Ошибка precheckout: {e}")
+        await query.answer(ok=False, error_message="Ошибка при подготовке оплаты. Попробуйте снова.")
+    
+if __name__ == "__main__":
+    print("🚀 Запускаю бота для Wildberries...")
+    print(f"🔑 Токен: {BOT_TOKEN[:10]}...")
+    print(f"🌐 Web App URL: {WEB_APP_URL}")
+    print(f"📞 Поддержка: {SUPPORT_USERNAME}")
+    
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Обработчики
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+        app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
+        app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+        
+        print("✅ Бот запущен!")
+        app.run_polling()
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
