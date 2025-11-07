@@ -321,6 +321,8 @@ async def add_product_to_db(
     price: float,
     scheduled_date: str,
 ):
+    from backend.new_parser import parse_wb_product_api  # локальный импорт
+
     async for session in get_session():
         result = await session.execute(select(User).where(User.tg_id == str(user_id)))
         user = result.scalar_one_or_none()
@@ -334,14 +336,42 @@ async def add_product_to_db(
             print(f"❌ Некорректный формат даты: {scheduled_date} ({e})")
             return {"success": False, "error": "Некорректный формат даты"}
 
+        # Парсим ещё раз, чтобы получить все поля (или можно принимать parsed из frontend)
+        parsed = await parse_wb_product_api(url)
+        if not parsed or not parsed.get("success"):
+            print(f"⚠️ Не удалось дополнительно распарсить товар {url}")
+            parsed = {}
+
+        # Берём основную картинку - приоритет: image_url (переданный) -> parsed.images[0] -> parsed['images'] -> None
+        main_image = image_url or (parsed.get("images") or [None])[0] or parsed.get("image") or None
+
+        # Собираем extra info (оставляем копию parsed в info)
+        extra_info = {
+            "parsed_raw": parsed,  # можно убрать/сжать при желании
+        }
+
         product = Product(
             user_id=str(user.tg_id),
             url=url,
-            name=name,
-            description=description,
-            image_url=image_url,
-            price=price,
-            status="pending",
+            name=name or parsed.get("name"),
+            description=description or parsed.get("description"),
+            image_url=main_image,
+            price=float(price) if price is not None else (parsed.get("price") or 0.0),
+
+            # Новые поля
+            wb_id=int(parsed.get("id") or parsed.get("articul")) if parsed.get("id") or parsed.get("articul") else None,
+            brand=parsed.get("brand"),
+            seller=parsed.get("seller"),
+            rating=float(parsed.get("rating")) if parsed.get("rating") is not None else None,
+            feedbacks=int(parsed.get("feedbacks")) if parsed.get("feedbacks") is not None else None,
+            basic_price=float(parsed.get("basic_price")) if parsed.get("basic_price") is not None else None,
+            discount=int(parsed.get("discount")) if parsed.get("discount") is not None else None,
+            stocks=int(parsed.get("stocks")) if parsed.get("stocks") is not None else None,
+            stocks_by_size=parsed.get("stocks_by_size"),
+            images=parsed.get("images"),
+
+            info=extra_info,
+            status=ProductStatus.pending,
             scheduled_date=scheduled_dt,
         )
 
