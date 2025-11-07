@@ -8,7 +8,8 @@ from new_parser import parse_wb_product_api
 import aiohttp
 from telegram import LabeledPrice
 from telegram.ext import PreCheckoutQueryHandler
-
+from datetime import datetime, timedelta
+import pytz
 
 load_dotenv()
 
@@ -19,6 +20,9 @@ WEB_APP_URL = "https://wb-seller.vercel.app/"
 BACKEND_URL = "https://api.hikinamuri.ru"
 SUPPORT_USERNAME = "@Hikinamuri"
 CHANNEL_ID = '@wbsellers_test'
+# 🔐 Список Telegram ID администраторов
+ADMIN_IDS = {933791537}  # замени на свои tg_id
+
 # Кэш для хранения результатов парсинга
 parsing_cache = {}
 
@@ -51,8 +55,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         greeting = (
             f"Привет, {user.first_name}! 👋\n\n"
-            "Я бот для автоматической выкладки товаров на Wildberries.\n\n"
-            "Для начала, пожалуйста, поделитесь контактом, чтобы зарегистрироваться 👇"
+            "Я бот канала @ekzoskidki и помогу тебе разместить рекламу быстро и без лишних шагов.\n\n"
+            "🔹 Поделитесь контактом, чтобы зарегистрироваться\n\n"
+            "🔹 Отправь ссылку на товар \n\n"
+            "🔹 Выбери категорию (для дома, детям, одежда и т.д.) \n\n"
+            "🔹 Укажи время публикации \n\n"
+            "Сейчас реклама размещается только в @ekzoskidki, но скоро появятся и другие каналы. \n\n"
+            "Нажми «Оформить заказ», чтобы начать 🚀."
         )
 
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -422,7 +431,54 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         print(f"❌ Ошибка precheckout: {e}")
         await query.answer(ok=False, error_message="Ошибка при подготовке оплаты. Попробуйте снова.")
-    
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика для администраторов"""
+    user_id = update.effective_user.id
+
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+        return
+
+    # Периоды, которые будем показывать
+    periods = {
+        "Сегодня": "day",
+        "Неделя": "week",
+        "Месяц": "month",
+        "Всё время": "all",
+    }
+
+    msg_lines = ["📊 <b>Статистика по заказам</b>\n"]
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            for label, period_key in periods.items():
+                async with session.get(f"{BACKEND_URL}/api/admin/stats?period={period_key}") as resp:
+                    if resp.status != 200:
+                        msg_lines.append(f"⚠️ Ошибка при запросе {label.lower()}")
+                        continue
+
+                    data = await resp.json()
+
+                    # Проверяем корректность формата
+                    if not data.get("success") or "stats" not in data:
+                        msg_lines.append(f"⚠️ Некорректный ответ ({label.lower()})")
+                        continue
+
+                    stats = data["stats"]
+
+                    msg_lines.append(f"🗓 <b>{label}</b>:")
+                    msg_lines.append(f" ✅ Выложено: {stats['posted_count']} постов × 300₽ = {stats['posted_amount']}₽")
+                    msg_lines.append(f" ⌛ Ожидает выкладки: {stats['pending_count']} постов × 300₽ = {stats['pending_amount']}₽\n")
+
+        await update.message.reply_text("\n".join(msg_lines), parse_mode="HTML")
+
+    except Exception as e:
+        print(f"❌ Ошибка при получении статистики: {e}")
+        await update.message.reply_text("⚠️ Не удалось получить статистику с сервера.")
+
+
+
 if __name__ == "__main__":
     print("🚀 Запускаю бота для Wildberries...")
     print(f"🔑 Токен: {BOT_TOKEN[:10]}...")
@@ -439,6 +495,7 @@ if __name__ == "__main__":
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
         app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+        app.add_handler(CommandHandler("stats", admin_stats))
         
         print("✅ Бот запущен!")
         app.run_polling()

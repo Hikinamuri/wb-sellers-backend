@@ -1,6 +1,7 @@
 # new_parser.py
 import aiohttp
 import re
+import asyncio
 import logging
 from typing import Dict, Optional, List, Any
 
@@ -117,13 +118,12 @@ class WBParser:
                 return False
         return False
     
-    async def _find_valid_images(self, articul: str, candidate_idxs: List[int] = None, max_images: int = 2) -> List[str]:
+    async def _find_valid_images(
+        self, articul: str, candidate_idxs: List[int] = None, max_images: int = 2
+    ) -> List[str]:
         """
-        Попытки найти реальные рабочие URL для изображений:
-        - используем набор доменов (sam-basket-cdn-01mt, ...),
-        - пробуем шаблоны /images/c516x688/{i}.webp и /images/big/{i}.jpg и другие,
-        - проверяем доступность через HEAD/GET.
-        Возвращаем список до max_images валидных ссылок.
+        Проверяет все известные CDN (асинхронно и конкурентно),
+        возвращает реально существующие картинки.
         """
         if not self.session:
             await self.setup()
@@ -131,69 +131,66 @@ class WBParser:
         if candidate_idxs is None:
             candidate_idxs = list(range(1, max_images + 1))
 
-        vol = articul[:4]
-        part = articul[:6]
-        bucket = str((int(articul) % 100)).zfill(2)
+        # Схемы: сначала новая, потом старая
+        path_variants = [
+            (articul[:4], articul[:6]),
+            (articul[:3], articul[:5]),
+        ]
 
-        # список доменов/шаблонов, порядок важен: наиболее вероятные — первыми
         domains = [
-            "https://sam-basket-cdn-01mt.geobasket.ru",
-            "https://sam-basket-cdn-02mt.geobasket.ru",
-            "https://sam-basket-cdn-03mt.geobasket.ru",
-            f"https://basket-{bucket}.wbbasket.ru",
+            *(f"https://sam-basket-cdn-{str(i).zfill(2)}mt.geobasket.ru" for i in range(1, 10)),
+            *(f"https://basket-{str(i).zfill(2)}.wbbasket.ru" for i in range(1, 10)),
+            "https://cdn.wbstatic.net",
             "https://img1.wbstatic.net",
         ]
 
-        patterns = [
-            "/vol{vol}/part{part}/{articul}/images/c516x688/{i}.webp",
-            "/vol{vol}/part{part}/{articul}/images/c800x1000/{i}.webp",
-            "/vol{vol}/part{part}/{articul}/images/big/{i}.jpg",
-            "/vol{vol}/part{part}/{articul}/images/{i}.jpg",
-            "/vol{vol}/part{part}/{articul}/images/{i}.webp",
-        ]
+        subdirs = ["c516x688", "c800x1000", "c246x328", "big", ""]
+        extensions = ["webp", "jpg", "jpeg"]
 
-        found: List[str] = []
+        # Собираем ВСЕ возможные URL для первой картинки (1.ext)
+        test_urls = []
+        for vol, part in path_variants:
+            for domain in domains:
+                for subdir in subdirs:
+                    for ext in extensions:
+                        subdir_path = f"/{subdir}" if subdir else ""
+                        test_urls.append((
+                            f"{domain}/vol{vol}/part{part}/{articul}/images{subdir_path}/1.{ext}",
+                            vol, part, subdir, ext
+                        ))
 
-        # Перебираем домены → паттерны → номера картинок и проверяем по очереди
-        for d in domains:
-            for pat in patterns:
-                if len(found) >= max_images:
-                    break
-                for i in candidate_idxs:
-                    if len(found) >= max_images:
-                        break
-                    url = d + pat.format(vol=vol, part=part, articul=articul, i=i)
-                    try:
-                        ok = await self._check_url_is_image(url, timeout=4.0)
-                    except Exception:
-                        ok = False
-                    if ok:
-                        found.append(url)
-                        logger.debug(f"🖼️ Valid image found: {url}")
-            if len(found) >= max_images:
-                break
+        async def check_candidate(url_info):
+            url, vol, part, subdir, ext = url_info
+            ok = await self._check_url_is_image(url, timeout=2.5)
+            return (url_info if ok else None)
 
-        # Если не нашлось ни одной — всё равно вернуть синтетические ссылки на наиболее вероятный домен
-        if not found:
-            # гарантируем хотя бы стандартные webp ссылки на sam-basket-cdn-01mt
-            fallback_domain = "https://sam-basket-cdn-01mt.geobasket.ru"
-            fallback = [
-                fallback_domain + f"/vol{vol}/part{part}/{articul}/images/c516x688/{i}.webp"
+        # Проверяем все URL одновременно
+        results = await asyncio.gather(*[check_candidate(info) for info in test_urls], return_exceptions=False)
+
+        # выбираем первый рабочий вариант
+        valid = next((r for r in results if r), None)
+        if valid:
+            url, vol, part, subdir, ext = valid
+            domain = url.split("/vol")[0]
+            subdir_path = f"/{subdir}" if subdir else ""
+            logger.info(
+                f"🖼️ Найден CDN для {articul}: {domain} "
+                f"(vol={vol}, part={part}, subdir='{subdir}', ext={ext})"
+            )
+            return [
+                f"{domain}/vol{vol}/part{part}/{articul}/images{subdir_path}/{i}.{ext}"
                 for i in candidate_idxs[:max_images]
             ]
-            logger.warning(f"⚠️ Не найдено валидных изображений для {articul}. Возвращаем fallback URLs.")
-            return fallback
 
-        # убираем дубликаты, оставляем максимум max_images
-        unique = []
-        for u in found:
-            if u not in unique:
-                unique.append(u)
-            if len(unique) >= max_images:
-                break
+        # fallback — ничего не нашли
+        logger.warning(f"⚠️ Не удалось найти изображения для {articul}, возвращаем fallback.")
+        vol, part = articul[:3], articul[:5]
+        return [
+            f"https://sam-basket-cdn-03mt.geobasket.ru/vol{vol}/part{part}/{articul}/images/c516x688/{i}.webp"
+            for i in candidate_idxs[:max_images]
+        ]
 
-        return unique
-    
+
     async def parse_api_detail(self, articul: str) -> Dict[str, Any]:
         """
         Получение деталей товара через card.wb.ru (v2).
@@ -223,12 +220,13 @@ class WBParser:
         p = products[0]
         sizes = p.get("sizes") or []
 
-        # логируем сырые поля
         logger.info(f"💰 WB RAW: salePriceU={p.get('salePriceU')}, priceU={p.get('priceU')} | sizes_count={len(sizes)}")
 
-        # --- цены ---
+        # --- Цены ---
         sale_price = 0.0
         basic_price = 0.0
+
+        # 1️⃣ Стандартные поля
         try:
             sale_u = p.get("salePriceU")
             price_u = p.get("priceU")
@@ -239,82 +237,43 @@ class WBParser:
         except Exception:
             pass
 
-        # fallback через sizes[].price
-        if (not sale_price or sale_price == 0.0) or (not basic_price or basic_price == 0.0):
+        # 2️⃣ Fallback — если верхних полей нет
+        if not sale_price or not basic_price:
             for s in sizes:
-                try:
-                    price_info = s.get("price") or s.get("prices") or {}
-                    if isinstance(price_info, dict):
-                        product_val = price_info.get("product") or price_info.get("sale") or price_info.get("total")
-                        basic_val = price_info.get("basic") or price_info.get("old") or price_info.get("base")
-                        if product_val:
-                            sale_price = float(product_val) / 100.0
-                        if basic_val:
-                            basic_price = float(basic_val) / 100.0
-                        if sale_price > 0:
-                            logger.info(f"💰 Fallback price from sizes: {sale_price}/{basic_price}")
-                            break
-                except Exception:
-                    continue
+                price_info = s.get("price") or {}
+                if isinstance(price_info, dict):
+                    sale_price = float(price_info.get("product", 0)) / 100.0
+                    basic_price = float(price_info.get("basic", 0)) / 100.0
+                    if sale_price:
+                        logger.info(f"💰 Fallback price from sizes: {sale_price}/{basic_price}")
+                        break
 
         discount = int(100 - (sale_price / basic_price * 100)) if basic_price else 0
 
-        # --- изображения: сначала ищем прямые url в API, иначе используем поиск/генерацию ---
-        images: List[str] = []
-        # если в API есть поле images с int-индексами — сформируем ссылки с проверкой
-        api_images = p.get("images")
-        if isinstance(api_images, list) and api_images and all(isinstance(x, int) for x in api_images):
-            # попробуем проверить для каждого индекса варианты доменов/паттернов
-            images = await self._find_valid_images(articul, candidate_idxs=api_images, max_images=min(1, len(api_images)))
-        else:
-            # если API содержит уже url-ы (реже) — взять их
-            possible_keys = ("images", "image", "imageUrl", "iis", "files", "media")
-            for key in possible_keys:
-                val = p.get(key)
-                if isinstance(val, list):
-                    for it in val:
-                        if isinstance(it, str) and it.startswith(("http://", "https://")):
-                            images.append(it)
-                        elif isinstance(it, dict):
-                            url = it.get("url") or it.get("image") or it.get("file")
-                            if isinstance(url, str) and url.startswith(("http://", "https://")):
-                                images.append(url)
-                elif isinstance(val, str) and val.startswith(("http://", "https://")):
-                    images.append(val)
-
-            # если пока нет — попробовать искать первые 6 индексов
-            if not images:
-                images = await self._find_valid_images(articul, candidate_idxs=list(range(1, 3)), max_images=2)
-
-        # очистка и уникализация
-        images = [u for i, u in enumerate(images) if isinstance(u, str) and u.startswith(("http://", "https://")) and images.index(u) == i]
-
-        # --- остатки: stocks_by_size и total ---
+        # --- Остатки ---
         stocks_by_size: List[Dict[str, Any]] = []
         for s in sizes:
-            try:
-                size_name = s.get("name") or s.get("size") or s.get("opt") or ""
-                qty = 0
-                stocks_arr = s.get("stocks") or s.get("offers") or []
-                if isinstance(stocks_arr, list):
-                    for st in stocks_arr:
-                        if isinstance(st, dict):
-                            try:
-                                qty += int(st.get("qty", 0) or 0)
-                            except Exception:
-                                continue
-                if not stocks_arr and s.get("qty") is not None:
-                    try:
-                        qty += int(s.get("qty") or 0)
-                    except Exception:
-                        pass
-                stocks_by_size.append({"size": size_name, "qty": qty})
-            except Exception:
-                continue
+            qty = 0
+            for st in s.get("stocks", []):
+                try:
+                    qty += int(st.get("qty", 0))
+                except Exception:
+                    pass
+            stocks_by_size.append({
+                "size": s.get("name") or "",
+                "qty": qty
+            })
+        total_stocks = sum(i["qty"] for i in stocks_by_size)
 
-        total_stocks = sum(item.get("qty", 0) for item in stocks_by_size)
+        # --- Изображения ---
+        images: List[str] = []
+        pics_count = int(p.get("pics") or 0)
+        if pics_count > 0:
+            images = await self._find_valid_images(articul, candidate_idxs=list(range(1, min(pics_count, 3) + 1)))
+        else:
+            images = await self._find_valid_images(articul, candidate_idxs=[1, 2], max_images=2)
 
-        result: Dict[str, Any] = {
+        result = {
             "id": p.get("id") or int(articul),
             "name": p.get("name"),
             "brand": p.get("brand"),
@@ -322,16 +281,19 @@ class WBParser:
             "seller": p.get("supplierName") or p.get("supplier"),
             "rating": p.get("reviewRating") or p.get("rating") or 0,
             "feedbacks": p.get("feedbacks") or 0,
-            "price": float(round(sale_price, 2)),
-            "basic_price": float(round(basic_price, 2)),
+            "price": round(sale_price, 2),
+            "basic_price": round(basic_price, 2),
             "discount": discount,
             "stocks": total_stocks,
             "stocks_by_size": stocks_by_size,
             "images": images,
-            "raw_product": p,  # можно убрать, но полезно для отладки
         }
 
-        logger.info(f"✅ Итог для {articul}: price={result['price']} (base={result['basic_price']}), total_stocks={result['stocks']}, images={len(images)}")
+        logger.info(
+            f"✅ Итог для {articul}: price={result['price']} base={result['basic_price']} "
+            f"stocks={result['stocks']} images={len(images)}"
+        )
+
         return result
 
     async def parse_product(self, url: str) -> Dict[str, Any]:

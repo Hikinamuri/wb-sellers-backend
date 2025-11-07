@@ -1,10 +1,11 @@
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 from datetime import datetime
 import httpx, uuid, hashlib, json
 from yookassa import Configuration, Payment
@@ -12,8 +13,9 @@ from telegram import Bot
 import os
 import re
 from database.db import get_session
-from database.models import Product, User
+from database.models import Product, User, ProductStatus
 from backend.new_parser import parse_wb_product_api
+import html  
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = "@wbsellers_test"  # или твой канал
@@ -72,8 +74,9 @@ async def create_payment(request: Request):
         "description": _sanitize_meta_field(meta.get("description", ""), 200),
         "price": _sanitize_meta_field(meta.get("price", ""), 32),
         "scheduled_date": _sanitize_meta_field(meta.get("scheduled_date", ""), 64),
+        "category": _sanitize_meta_field(meta.get("category", ""), 64),
     }
-
+    print("🧾 SAFE META:", safe_meta)
     # Возвращаем всё, что нужно боту
     return {
         "success": True,
@@ -94,11 +97,23 @@ async def publish_product(product_id: int):
             print(f"❌ Товар с id={product_id} не найден")
             return
 
+        # 🧮 Извлекаем данные
+        name = product.name or "Без названия"
+        url = product.url or ""
+        price = f"{int(product.price)} ₽" if product.price else "—"
+        basic_price = f"{int(product.basic_price)} ₽" if product.basic_price else "—"
+        stocks = product.stocks or 0
+        wb_id = product.wb_id or "—"
+        category = product.category or "Разное"
+
+        # 🧾 Формируем HTML-пост
         caption = (
-            f"🛍 {product.name}\n\n"
-            f"{product.description or ''}\n\n"
-            f"💰 Цена: {product.price} руб.\n"
-            f"🔗 {product.url}"
+            f"✅ <b><a href=\"{html.escape(url)}\">{html.escape(name)}</a></b>\n\n"
+            f"💰 <b>Цена со скидкой:</b> {price}\n"
+            f"💸 <s>Цена старая:</s> {basic_price}\n"
+            f"🛒 <b>Остаток:</b> {stocks} шт.\n"
+            f"📝 <b>Артикул:</b> {wb_id}\n\n"
+            f"#{category.replace(' ', '_')}"
         )
 
         try:
@@ -107,9 +122,14 @@ async def publish_product(product_id: int):
                     chat_id=CHANNEL_ID,
                     photo=product.image_url,
                     caption=caption[:1024],
+                    parse_mode="HTML",
                 )
             else:
-                await bot.send_message(chat_id=CHANNEL_ID, text=caption)
+                await bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=caption[:1024],
+                    parse_mode="HTML",
+                )
 
             product.status = "posted"
             await session.commit()
@@ -117,7 +137,7 @@ async def publish_product(product_id: int):
             print(f"✅ Товар опубликован: {product.name}")
         except Exception as e:
             print(f"❌ Ошибка публикации товара {product_id}: {e}")
-        
+            
 @app.post("/api/products/parse")
 async def parse_product(request: Request):
     """
@@ -153,6 +173,7 @@ async def add_product(request: Request):
     image_url = data.get("image_url")
     price = data.get("price")
     scheduled_date = data.get("scheduled_date")
+    category = data.get("category")  # <-- добавили получение категории из тела запроса
 
     if not all([tg_id, url, name, scheduled_date]):
         return {"success": False, "error": "Отсутствуют обязательные поля"}
@@ -170,36 +191,74 @@ async def add_product(request: Request):
         except ValueError:
             return {"success": False, "error": "Некорректный формат даты (ожидается ISO)"}
 
-        # Создаём товар
+        # 🧩 Парсим товар
+        parsed = await parse_wb_product_api(url)
+        if not parsed or not parsed.get("success"):
+            parsed = {}
+            print(f"⚠️ Не удалось распарсить товар: {url}")
+        else:
+            print(f"✅ Товар распарсен: {parsed.get('name')}")
+
+        # 🖼 Основное изображение
+        main_image = image_url or (parsed.get("images") or [None])[0]
+
+        # 🏷 Категория (приоритет: фронт → парсер → запасное значение)
+        final_category = (
+            category
+            or parsed.get("category")
+            or parsed.get("subcategory")
+            or parsed.get("subject_name")
+            or "Не указана"
+        )
+        print(f"📦 CATEGORY SELECTED: {final_category}")
+
+        # 🧱 Создаём товар
         product = Product(
             user_id=str(tg_id),
             url=url,
-            name=name,
-            description=description,
-            image_url=image_url,
-            price=price,
-            status="pending",  # ожидает выкладки
+            name=name or parsed.get("name"),
+            description=description or parsed.get("description"),
+            image_url=main_image,
+            price=float(price) if price else (parsed.get("price") or 0.0),
+
+            wb_id=int(parsed.get("id") or parsed.get("articul")) if parsed.get("id") or parsed.get("articul") else None,
+            brand=parsed.get("brand"),
+            seller=parsed.get("seller"),
+            rating=float(parsed.get("rating")) if parsed.get("rating") is not None else None,
+            feedbacks=int(parsed.get("feedbacks")) if parsed.get("feedbacks") is not None else None,
+            basic_price=float(parsed.get("basic_price")) if parsed.get("basic_price") is not None else None,
+            discount=int(parsed.get("discount")) if parsed.get("discount") is not None else None,
+            stocks=int(parsed.get("stocks")) if parsed.get("stocks") is not None else None,
+            stocks_by_size=parsed.get("stocks_by_size"),
+            images=parsed.get("images"),
+            info={"parsed_raw": parsed},
+            status=ProductStatus.pending,
+            category=final_category,  # ✅ теперь переменная определена
             scheduled_date=scheduled_dt,
         )
 
+        # 💾 Сохраняем в БД
         session.add(product)
         await session.commit()
         await session.refresh(product)
 
-        # Планируем публикацию
+        print(f"✅ Товар сохранён (ID={product.id}, Категория={product.category})")
+
+        # ⏰ Планируем публикацию
         scheduler.add_job(
             publish_product,
             trigger=DateTrigger(run_date=scheduled_dt),
-            args=[product.id],  # передаем id, не объект!
+            args=[product.id],
             id=f"publish_{product.id}",
         )
 
-        print(f"✅ Товар сохранён и запланирован на {scheduled_dt}: {product.name}")
+        print(f"🗓 Публикация запланирована на {scheduled_dt}")
 
         return {
             "success": True,
             "message": "Товар добавлен в очередь на выкладку",
             "product_id": product.id,
+            "category": product.category,
         }
 
 @app.post("/api/users/register")
@@ -287,6 +346,7 @@ async def yookassa_callback(request: Request):
         image_url = metadata.get("image_url") or ""
         price = metadata.get("price") or 0
         scheduled_date = metadata.get("scheduled_date")
+        category = metadata.get("category")
 
         # Добавляем в БД (если есть все обязательные поля)
         if user_id and url and name and scheduled_date:
@@ -299,6 +359,7 @@ async def yookassa_callback(request: Request):
                     image_url=image_url,
                     price=float(price) if price else 0,
                     scheduled_date=scheduled_date,
+                    category=category,
                 )
                 if res.get("success"):
                     print("✅ Товар добавлен в БД после оплаты")
@@ -320,6 +381,7 @@ async def add_product_to_db(
     image_url: str,
     price: float,
     scheduled_date: str,
+    category: str = None, 
 ):
     from backend.new_parser import parse_wb_product_api  # локальный импорт
 
@@ -369,7 +431,7 @@ async def add_product_to_db(
             stocks=int(parsed.get("stocks")) if parsed.get("stocks") is not None else None,
             stocks_by_size=parsed.get("stocks_by_size"),
             images=parsed.get("images"),
-
+            category=category,
             info=extra_info,
             status=ProductStatus.pending,
             scheduled_date=scheduled_dt,
@@ -393,3 +455,60 @@ async def add_product_to_db(
         print(f"✅ Товар '{product.name}' сохранён и запланирован на {scheduled_dt}")
         return {"success": True, "product_id": product.id}
 
+
+from datetime import timedelta
+import pytz
+
+@app.get("/api/admin/stats")
+async def admin_stats(
+    session: AsyncSession = Depends(get_session),
+    period: str = Query("day", description="Период статистики: day|week|month|all")
+):
+    """
+    📊 Возвращает статистику по постам за указанный период:
+    - day: сегодня
+    - week: последние 7 дней
+    - month: последние 30 дней
+    - all: всё время
+    """
+    try:
+        tz = pytz.timezone("Europe/Moscow")
+        now = datetime.now(tz)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Определяем границы по периоду
+        if period == "day":
+            start_date = today_start
+        elif period == "week":
+            start_date = today_start - timedelta(days=7)
+        elif period == "month":
+            start_date = today_start - timedelta(days=30)
+        else:
+            start_date = None  # без фильтра по дате
+
+        # Формируем запрос
+        query = select(Product)
+        if start_date:
+            query = query.where(Product.created_at >= start_date)
+
+        result = await session.execute(query)
+        products = result.scalars().all()
+
+        total_posts = len(products)
+        posted = [p for p in products if str(p.status) in ("posted", "ProductStatus.posted")]
+        pending = [p for p in products if str(p.status) in ("pending", "ProductStatus.pending")]
+
+        stats = {
+            "period": period,
+            "total_posts": total_posts,
+            "posted_count": len(posted),
+            "pending_count": len(pending),
+            "posted_amount": len(posted) * 300,
+            "pending_amount": len(pending) * 300,
+        }
+
+        return JSONResponse(content={"success": True, "stats": stats})
+
+    except Exception as e:
+        print(f"❌ Ошибка при вычислении статистики: {e}")
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
