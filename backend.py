@@ -100,7 +100,7 @@ async def create_payment(request: Request):
                     "capture": True,
                     "description": description,
                     "metadata": safe_meta,
-                    "test"='true',
+                    "test": True,
                     "receipt": {  # 👇 Обязательно при включённой фискализации
                         "customer": {
                             "email": "danya.pochta76@gmail.com",  # или phone
@@ -136,7 +136,7 @@ async def create_payment(request: Request):
                     "capture": True,
                     "description": description,
                     "metadata": safe_meta,
-                    "test"='true',
+                    "test": True,
                     "receipt": {  # 👇 Обязательно при включённой фискализации
                         "customer": {
                             "email": "danya.pochta76@gmail.com",  # или phone
