@@ -10,6 +10,7 @@ from telegram import LabeledPrice
 from telegram.ext import PreCheckoutQueryHandler
 from datetime import datetime, timedelta
 import pytz
+import base64
 
 load_dotenv()
 
@@ -307,7 +308,15 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Если это данные для оплаты — создаём инвойс
         if data.get("success") and "prices" in data:
             prices = [LabeledPrice(**p) for p in data["prices"]]
-            context.user_data["pending_order_meta"] = data.get("metadata")
+
+            # --- Сохраняем в context и явно добавляем yookassa_payment_id (если есть) ---
+            pending_meta = data.get("metadata", {}) or {}
+            # если backend вернул yookassa_payment_id — сохраняем его
+            if data.get("yookassa_payment_id"):
+                pending_meta["yookassa_payment_id"] = data.get("yookassa_payment_id")
+            # сохраняем весь meta в память бота (временно, для обработки successful_payment)
+            context.user_data["pending_order_meta"] = pending_meta
+            # -------------------------------------------------------------------------
 
             await update.message.reply_invoice(
                 title=data["title"],
@@ -320,9 +329,8 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
                 need_name=True,
                 need_phone_number=True,
             )
-            return  # выходим, чтобы не шло в другие блоки
+            return
 
-        # Старый код (оставляем для парсинга и прочих событий)
         action = data.get('action')
 
         if action == 'create_order':
@@ -349,44 +357,84 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     payment = update.message.successful_payment
     print(f"💸 Успешная оплата: {payment.to_dict()}")
 
-    # payload = payment.invoice_payload  # не используем payload для meta — используем context.user_data
-    meta = context.user_data.get("pending_order_meta")
+    # Берём сохранённый meta (тот, что мы положили в handle_web_app_data)
+    pending_meta = context.user_data.get("pending_order_meta", {}) or {}
 
-    if not meta:
-        await update.message.reply_text("⚠️ Не удалось получить данные о заказе.")
-        return
+    # Предпочитаем yookassa_payment_id из pending_meta (тот, что создал backend)
+    yk_id = pending_meta.get("yookassa_payment_id")
 
-    # Убедимся, что category в meta (если нет — попробуем fallback)
-    category = meta.get("category") or meta.get("cat") or meta.get("category_selected") or "Не указана"
+    # Если yk_id нет — можно попытаться использовать provider_payment_charge_id как fallback,
+    # но это часто НЕ ДАЁТ нужных metadata (см. обсуждение).
+    if not yk_id:
+        print("⚠️ yookassa_payment_id не найден в context.user_data, пробуем provider_payment_charge_id как fallback")
+        yk_id = payment.provider_payment_charge_id
+
+    # Получаем ключи
+    yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
+    yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
+
+    # Если есть yk_id и креды — делаем запрос в YooKassa, чтобы получить официальные metadata
+    remote_meta = {}
+    if yk_id and yookassa_account and yookassa_secret:
+        try:
+            auth = aiohttp.BasicAuth(yookassa_account, yookassa_secret)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://api.yookassa.ru/v3/payments/{yk_id}", auth=auth) as resp:
+                    if resp.status == 200:
+                        payment_data = await resp.json()
+                        print(f"📦 Ответ YooKassa: {json.dumps(payment_data, ensure_ascii=False, indent=2)}")
+                        remote_meta = payment_data.get("metadata", {}) or {}
+                    else:
+                        text = await resp.text()
+                        print(f"⚠️ YooKassa returned {resp.status}: {text}")
+        except Exception as e:
+            print(f"❌ Ошибка при запросе к YooKassa: {e}")
+
+    # Если remote_meta пустой — используем pending_meta, иначе используем remote_meta (точнее)
+    meta = remote_meta or pending_meta or {}
+
+    # Гарантируем наличие category
+    category = meta.get("category") or "Не указана"
     meta["category"] = category
 
+    # Валидация обязательных полей перед отправкой на backend
+    user_id = meta.get("user_id")
+    url = meta.get("url")
+    name = meta.get("name")
+    scheduled_date = meta.get("scheduled_date")
+
+    if not (user_id and url and name and scheduled_date):
+        await update.message.reply_text("⚠️ Не удалось получить все данные заказа из платежа. Обратитесь в поддержку.")
+        print("❌ Недостаточно данных для добавления товара:", meta)
+        return
+
+    # Отправляем на backend /api/products/add
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{BACKEND_URL}/api/products/add",
                 json={
-                    "user_id": meta.get("user_id"),
-                    "url": meta.get("url"),
-                    "name": meta.get("name"),
-                    "description": meta.get("description"),
-                    "image_url": meta.get("image_url"),
+                    "user_id": user_id,
+                    "url": url,
+                    "name": name,
+                    "description": meta.get("description") or "",
+                    "image_url": meta.get("image_url") or None,
                     "price": float(meta.get("price") or 0),
-                    "scheduled_date": meta.get("scheduled_date"),
-                    "category": meta.get("category"),
+                    "scheduled_date": scheduled_date,
+                    "category": category,
                 },
             ) as resp:
                 result = await resp.json()
                 print(f"📦 Ответ от /api/products/add: {result}")
 
         if result.get("success"):
-            await update.message.reply_text("✅ Оплата получена! Товар добавлен в очередь на выкладку.")
+            await update.message.reply_text("✅ Оплата подтверждена! Товар добавлен в очередь на выкладку.")
         else:
-            await update.message.reply_text(f"⚠️ Оплата успешна, но не удалось добавить товар: {result.get('error')}")
+            await update.message.reply_text(f"⚠️ Оплата прошла, но не удалось добавить товар: {result.get('error')}")
     except Exception as e:
         print(f"❌ Ошибка при добавлении товара после оплаты: {e}")
         await update.message.reply_text("❌ Ошибка при добавлении товара в базу.")
 
-    
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     try:

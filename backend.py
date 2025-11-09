@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from sqlalchemy.future import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, OperationalError, InterfaceError
 from sqlalchemy import text
 from datetime import datetime, timezone
 import httpx, uuid, hashlib, json
@@ -48,6 +48,12 @@ def _sanitize_meta_field(value: any, max_len: int = 128) -> str:
     if len(s) > max_len:
         return s[:max_len]
     return s
+
+@app.on_event("startup")
+async def startup_event():
+    from database.db import test_connection
+    await test_connection()
+
 
 @app.post("/api/payments/create")
 async def create_payment(request: Request):
@@ -137,54 +143,78 @@ async def create_payment(request: Request):
         "yookassa_payment_id": yookassa_payment.get("id"),
     }
 
-async def publish_product(product_id: int):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Product).where(Product.id == product_id))
-        product = result.scalar_one_or_none()
-        if not product:
-            print(f"❌ Товар с id={product_id} не найден")
-            return
+async def publish_product(product_id: int, max_retries: int = 3):
+    """Публикует товар в канал с автопереподключением к БД при обрывах."""
+    from database.db import AsyncSessionLocal  # импорт внутри, чтобы не было циклов
+    from database.models import Product
 
-        # 🧮 Извлекаем данные
-        name = product.name or "Без названия"
-        url = product.url or ""
-        price = f"{int(product.price)} ₽" if product.price else "—"
-        basic_price = f"{int(product.basic_price)} ₽" if product.basic_price else "—"
-        stocks = product.stocks or 0
-        wb_id = product.wb_id or "—"
-        category = product.category or "Разное"
-
-        # 🧾 Формируем HTML-пост
-        caption = (
-            f"✅ <b><a href=\"{html.escape(url)}\">{html.escape(name)}</a></b>\n\n"
-            f"💰 <b>Цена со скидкой:</b> {price}\n"
-            f"💸 <s>Цена старая:{basic_price}</s>\n"
-            f"🛒 <b>Остаток:</b> {stocks} шт.\n"
-            f"📝 <b>Артикул:</b> {wb_id}\n\n"
-            f"#{category.replace(' ', '_')}"
-        )
-
+    for attempt in range(max_retries):
         try:
-            if product.image_url:
-                await bot.send_photo(
-                    chat_id=CHANNEL_ID,
-                    photo=product.image_url,
-                    caption=caption[:1024],
-                    parse_mode="HTML",
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(Product).where(Product.id == product_id))
+                product = result.scalar_one_or_none()
+
+                if not product:
+                    print(f"❌ Товар с id={product_id} не найден")
+                    return
+
+                # 🧮 Извлекаем данные
+                name = product.name or "Без названия"
+                url = product.url or ""
+                price = f"{int(product.price)} ₽" if product.price else "—"
+                basic_price = f"{int(product.basic_price)} ₽" if product.basic_price else "—"
+                stocks = product.stocks or 0
+                wb_id = product.wb_id or "—"
+                category = product.category or "Разное"
+
+                caption = (
+                    f"✅ <b><a href=\"{html.escape(url)}\">{html.escape(name)}</a></b>\n\n"
+                    f"💰 <b>Цена со скидкой:</b> {price}\n"
+                    f"💸 <s>Цена старая:{basic_price}</s>\n"
+                    f"🛒 <b>Остаток:</b> {stocks} шт.\n"
+                    f"📝 <b>Артикул:</b> {wb_id}\n\n"
+                    f"#{category.replace(' ', '_')}"
                 )
+
+                # 📨 Отправляем пост
+                try:
+                    if product.image_url:
+                        await bot.send_photo(
+                            chat_id=CHANNEL_ID,
+                            photo=product.image_url,
+                            caption=caption[:1024],
+                            parse_mode="HTML",
+                        )
+                    else:
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=caption[:1024],
+                            parse_mode="HTML",
+                        )
+                    print(f"✅ Сообщение о товаре {product.id} отправлено в Telegram")
+                except Exception as tg_err:
+                    print(f"⚠️ Ошибка Telegram API при публикации {product_id}: {tg_err}")
+
+                # 🧾 Обновляем статус
+                product.status = "posted"
+                await session.commit()
+
+                print(f"✅ Товар опубликован: {product.name}")
+                return
+
+        except (OperationalError, InterfaceError) as db_err:
+            print(f"⚠️ Ошибка соединения с БД при публикации {product_id}: {db_err}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3)
+                print(f"🔁 Повтор попытки ({attempt + 2}/{max_retries})...")
+                continue
             else:
-                await bot.send_message(
-                    chat_id=CHANNEL_ID,
-                    text=caption[:1024],
-                    parse_mode="HTML",
-                )
+                print(f"❌ Не удалось подключиться к БД после {max_retries} попыток")
+                return
 
-            product.status = "posted"
-            await session.commit()
-
-            print(f"✅ Товар опубликован: {product.name}")
         except Exception as e:
-            print(f"❌ Ошибка публикации товара {product_id}: {e}")
+            print(f"❌ Неожиданная ошибка при публикации {product_id}: {e}")
+            return
             
 @app.post("/api/products/parse")
 async def parse_product(request: Request):
