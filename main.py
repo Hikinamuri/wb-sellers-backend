@@ -22,7 +22,7 @@ BACKEND_URL = "https://api.hikinamuri.ru"
 SUPPORT_USERNAME = "@Hikinamuri"
 CHANNEL_ID = '@wbsellers_test'
 # 🔐 Список Telegram ID администраторов
-ADMIN_IDS = {933791537, 455197004}  # замени на свои tg_id
+ADMIN_IDS = {933791537, 455197004, 933791537}  # замени на свои tg_id
 
 # Кэш для хранения результатов парсинга
 parsing_cache = {}
