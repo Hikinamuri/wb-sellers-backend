@@ -4,7 +4,8 @@ from fastapi.responses import JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from sqlalchemy.future import select
-from sqlalchemy.ext.asyncio import AsyncSession, OperationalError, InterfaceError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import OperationalError, InterfaceError
 from sqlalchemy import text
 from datetime import datetime, timezone
 import httpx, uuid, hashlib, json
