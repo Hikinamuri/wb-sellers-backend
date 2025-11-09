@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, PreCheckoutQueryHandler
 from new_parser import parse_wb_product_api
 import aiohttp
@@ -446,49 +446,76 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer(ok=False, error_message="Ошибка при подготовке оплаты. Попробуйте снова.")
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика для администраторов"""
+    """Главное меню статистики"""
     user_id = update.effective_user.id
-
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+        await update.message.reply_text("⛔ У вас нет доступа.")
         return
 
-    # Периоды, которые будем показывать
-    periods = {
-        "Сегодня": "day",
-        "Неделя": "week",
-        "Месяц": "month",
-        "Всё время": "all",
-    }
+    now = datetime.now()
+    year = now.year
+    months = [
+        ("Январь", 1), ("Февраль", 2), ("Март", 3), ("Апрель", 4),
+        ("Май", 5), ("Июнь", 6), ("Июль", 7), ("Август", 8),
+        ("Сентябрь", 9), ("Октябрь", 10), ("Ноябрь", 11), ("Декабрь", 12)
+    ]
 
-    msg_lines = ["📊 <b>Статистика по заказам</b>\n"]
+    keyboard = [
+        [InlineKeyboardButton(name, callback_data=f"month:{year}:{m}")]
+        for name, m in months
+    ]
+    await update.message.reply_text(
+        "📆 Выберите месяц для просмотра статистики:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            for label, period_key in periods.items():
-                async with session.get(f"{BACKEND_URL}/api/admin/stats?period={period_key}") as resp:
-                    if resp.status != 200:
-                        msg_lines.append(f"⚠️ Ошибка при запросе {label.lower()}")
-                        continue
 
-                    data = await resp.json()
+async def month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает недели выбранного месяца"""
+    query = update.callback_query
+    await query.answer()
+    _, year, month = query.data.split(":")
+    year, month = int(year), int(month)
 
-                    # Проверяем корректность формата
-                    if not data.get("success") or "stats" not in data:
-                        msg_lines.append(f"⚠️ Некорректный ответ ({label.lower()})")
-                        continue
+    # создаём кнопки для недель
+    weeks = []
+    start = datetime(year, month, 1)
+    for i in range(5):  # максимум 5 недель
+        week_start = start + timedelta(days=i * 7)
+        week_end = week_start + timedelta(days=6)
+        label = f"Неделя {i+1} ({week_start:%d.%m}–{week_end:%d.%m})"
+        weeks.append([InlineKeyboardButton(label, callback_data=f"week:{year}:{month}:{i+1}")])
 
-                    stats = data["stats"]
+    await query.edit_message_text(
+        f"📊 Статистика за {start.strftime('%B %Y')}\nВыберите неделю:",
+        reply_markup=InlineKeyboardMarkup(weeks)
+    )
 
-                    msg_lines.append(f"🗓 <b>{label}</b>:")
-                    msg_lines.append(f" ✅ Выложено: {stats['posted_count']} постов × 300₽ = {stats['posted_amount']}₽")
-                    msg_lines.append(f" ⌛ Ожидает выкладки: {stats['pending_count']} постов × 300₽ = {stats['pending_amount']}₽\n")
 
-        await update.message.reply_text("\n".join(msg_lines), parse_mode="HTML")
+async def week_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику за неделю"""
+    query = update.callback_query
+    await query.answer()
+    _, year, month, week = query.data.split(":")
+    year, month, week = int(year), int(month), int(week)
 
-    except Exception as e:
-        print(f"❌ Ошибка при получении статистики: {e}")
-        await update.message.reply_text("⚠️ Не удалось получить статистику с сервера.")
+    async with aiohttp.ClientSession() as session:
+        url = f"{BACKEND_URL}/api/admin/stats?type=week&year={year}&month={month}&week={week}"
+        async with session.get(url) as resp:
+            data = await resp.json()
+
+    if not data.get("success"):
+        await query.edit_message_text("⚠️ Ошибка при получении статистики.")
+        return
+
+    stats = data["stats"]
+    msg = (
+        f"📊 Статистика за неделю {week} ({month:02}.{year}):\n\n"
+        f"✅ Выложено: {stats['posted_count']} × 300₽ = {stats['posted_amount']}₽\n"
+        f"⌛ В ожидании: {stats['pending_count']} × 300₽ = {stats['pending_amount']}₽"
+    )
+
+    await query.edit_message_text(msg)
 
 
 

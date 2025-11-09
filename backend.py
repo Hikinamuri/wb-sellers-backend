@@ -334,6 +334,7 @@ async def add_product(request: Request):
                 args=[product.id],
                 id=f"publish_{product.id}",
                 replace_existing=True,  # 👈 чтобы не падало, если такая задача уже есть
+                misfire_grace_time=300,
             )
             print(f"🗓 Задача добавлена: publish_{product.id}")
         except Exception as e:
@@ -559,45 +560,70 @@ import pytz
 @app.get("/api/admin/stats")
 async def admin_stats(
     session: AsyncSession = Depends(get_session),
-    period: str = Query("day", description="Период статистики: day|week|month|all")
+    type: str = Query("day", description="Тип периода: day|week|month|all"),
+    year: int = Query(None, description="Год (например, 2025)"),
+    month: int = Query(None, description="Месяц (1-12)"),
+    week: int = Query(None, description="Номер недели (1–5 внутри месяца)"),
 ):
     """
-    📊 Возвращает статистику по постам за указанный период:
-    - day: сегодня
-    - week: последние 7 дней
-    - month: последние 30 дней
-    - all: всё время
+    📊 Возвращает статистику по постам:
+    - type=day → за сегодня
+    - type=month&year=2025&month=1 → за январь 2025
+    - type=week&year=2025&month=1&week=2 → за вторую неделю января 2025
+    - type=all → за всё время
     """
     try:
         tz = pytz.timezone("Europe/Moscow")
         now = datetime.now(tz)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # Определяем границы по периоду
-        if period == "day":
-            start_date = today_start
-        elif period == "week":
-            start_date = today_start - timedelta(days=7)
-        elif period == "month":
-            start_date = today_start - timedelta(days=30)
+        # 🧮 Определяем временные границы
+        if type == "day":
+            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_date = start_date + timedelta(days=1)
+
+        elif type == "month" and year and month:
+            start_date = datetime(year, month, 1, tzinfo=tz)
+            # следующий месяц минус 1 секунда
+            if month == 12:
+                end_date = datetime(year + 1, 1, 1, tzinfo=tz)
+            else:
+                end_date = datetime(year, month + 1, 1, tzinfo=tz)
+
+        elif type == "week" and year and month and week:
+            month_start = datetime(year, month, 1, tzinfo=tz)
+            # считаем недельные интервалы от начала месяца
+            week_start = month_start + timedelta(days=(week - 1) * 7)
+            week_end = week_start + timedelta(days=7)
+            start_date, end_date = week_start, week_end
+
+        elif type == "all":
+            start_date, end_date = None, None
+
         else:
-            start_date = None  # без фильтра по дате
+            return JSONResponse(
+                content={"success": False, "error": "Некорректные параметры периода"},
+                status_code=400,
+            )
 
-        # Формируем запрос
+        # 🧩 Запрос к БД
         query = select(Product)
-        if start_date:
+        if start_date and end_date:
+            query = query.where(Product.created_at >= start_date, Product.created_at < end_date)
+        elif start_date:
             query = query.where(Product.created_at >= start_date)
 
         result = await session.execute(query)
         products = result.scalars().all()
 
-        total_posts = len(products)
         posted = [p for p in products if str(p.status) in ("posted", "ProductStatus.posted")]
         pending = [p for p in products if str(p.status) in ("pending", "ProductStatus.pending")]
 
         stats = {
-            "period": period,
-            "total_posts": total_posts,
+            "type": type,
+            "year": year,
+            "month": month,
+            "week": week,
+            "total_posts": len(products),
             "posted_count": len(posted),
             "pending_count": len(pending),
             "posted_amount": len(posted) * 300,
@@ -609,7 +635,7 @@ async def admin_stats(
     except Exception as e:
         print(f"❌ Ошибка при вычислении статистики: {e}")
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
-    
+
 
 def normalize_datetime(value):
     if isinstance(value, str):
