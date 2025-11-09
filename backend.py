@@ -16,6 +16,8 @@ from database.db import get_session, AsyncSessionLocal
 from database.models import Product, User, ProductStatus
 from backend.new_parser import parse_wb_product_api
 import html  
+from dotenv import load_dotenv
+
 
 load_dotenv()
 
