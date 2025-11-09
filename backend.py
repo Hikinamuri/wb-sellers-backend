@@ -82,9 +82,21 @@ async def create_payment(request: Request):
     yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
 
     if not yookassa_secret or not yookassa_account:
-        print("⚠️ YooKassa credentials not set, skipping real payment creation")
-        
-        yookassa_payment = {"id": f"test_{order_id}"}
+        async with httpx.AsyncClient() as client:
+            yookassa_payment = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                auth=(yookassa_account, yookassa_secret),
+                headers={"Idempotence-Key": order_id},
+                json={
+                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+                    "confirmation": {"type": "redirect", "return_url": "https://t.me/WildBerriesSellers_bot"},
+                    "capture": True,
+                    "description": description,
+                    "metadata": safe_meta,
+                },
+                timeout=10.0,
+            )
+            yookassa_payment = yookassa_payment.json()
     else:
         async with httpx.AsyncClient() as client:
             yookassa_payment = await client.post(
@@ -112,7 +124,6 @@ async def create_payment(request: Request):
         "prices": prices,
         "provider_token": os.getenv("TELEGRAM_PROVIDER_TOKEN"),
         "metadata": safe_meta,
-        "success": True,
         "yookassa_payment_id": yookassa_payment.get("id"),
     }
 
