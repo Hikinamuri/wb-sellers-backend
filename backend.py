@@ -17,6 +17,8 @@ from database.models import Product, User, ProductStatus
 from backend.new_parser import parse_wb_product_api
 import html  
 
+load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = "@wbsellers_test"  # или твой канал
 TELEGRAM_PROVIDER_TOKEN=os.getenv("TELEGRAM_PROVIDER_TOKEN")
