@@ -6,13 +6,13 @@ from apscheduler.triggers.date import DateTrigger
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx, uuid, hashlib, json
 from yookassa import Configuration, Payment
 from telegram import Bot
 import os
 import re
-from database.db import get_session
+from database.db import get_session, AsyncSessionLocal
 from database.models import Product, User, ProductStatus
 from backend.new_parser import parse_wb_product_api
 import html  
@@ -47,8 +47,6 @@ def _sanitize_meta_field(value: any, max_len: int = 128) -> str:
 
 @app.post("/api/payments/create")
 async def create_payment(request: Request):
-    import uuid
-
     try:
         data = await request.json()
     except Exception:
@@ -65,7 +63,7 @@ async def create_payment(request: Request):
     # Telegram требует сумму в КОПЕЙКАХ
     prices = [{"label": "Публикация", "amount": int(amount * 100)}]
 
-    # Храним короткое metadata, чтобы потом обработать callback
+    # 🔒 Санитизируем и сохраняем meta
     safe_meta = {
         "order_id": order_id,
         "user_id": _sanitize_meta_field(meta.get("user_id") or meta.get("tg_id") or "", 64),
@@ -76,8 +74,35 @@ async def create_payment(request: Request):
         "scheduled_date": _sanitize_meta_field(meta.get("scheduled_date", ""), 64),
         "category": _sanitize_meta_field(meta.get("category", ""), 64),
     }
+
     print("🧾 SAFE META:", safe_meta)
-    # Возвращаем всё, что нужно боту
+
+    # ⚙️ Создаём платёж в YooKassa (тест или боевой режим)
+    yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
+    yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
+
+    if not yookassa_secret or not yookassa_account:
+        print("⚠️ YooKassa credentials not set, skipping real payment creation")
+        
+        yookassa_payment = {"id": f"test_{order_id}"}
+    else:
+        async with httpx.AsyncClient() as client:
+            yookassa_payment = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                auth=(yookassa_account, yookassa_secret),
+                headers={"Idempotence-Key": order_id},
+                json={
+                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+                    "confirmation": {"type": "redirect", "return_url": "https://t.me/WildBerriesSellers_bot"},
+                    "capture": True,
+                    "description": description,
+                    "metadata": safe_meta,
+                },
+                timeout=10.0,
+            )
+            yookassa_payment = yookassa_payment.json()
+
+    # 🧠 Возвращаем данные для Telegram Bot API
     return {
         "success": True,
         "payload": f"order_{order_id}",
@@ -87,10 +112,12 @@ async def create_payment(request: Request):
         "prices": prices,
         "provider_token": os.getenv("TELEGRAM_PROVIDER_TOKEN"),
         "metadata": safe_meta,
+        "success": True,
+        "yookassa_payment_id": yookassa_payment.get("id"),
     }
 
 async def publish_product(product_id: int):
-    async for session in get_session():
+    async with AsyncSessionLocal() as session:
         result = await session.execute(select(Product).where(Product.id == product_id))
         product = result.scalar_one_or_none()
         if not product:
@@ -110,7 +137,7 @@ async def publish_product(product_id: int):
         caption = (
             f"✅ <b><a href=\"{html.escape(url)}\">{html.escape(name)}</a></b>\n\n"
             f"💰 <b>Цена со скидкой:</b> {price}\n"
-            f"💸 <s>Цена старая:</s> {basic_price}\n"
+            f"💸 <s>Цена старая:{basic_price}</s>\n"
             f"🛒 <b>Остаток:</b> {stocks} шт.\n"
             f"📝 <b>Артикул:</b> {wb_id}\n\n"
             f"#{category.replace(' ', '_')}"
@@ -162,9 +189,6 @@ async def parse_product(request: Request):
 
 @app.post("/api/products/add")
 async def add_product(request: Request):
-    """
-    Добавляет распарсенный товар в базу данных и планирует выкладку.
-    """
     data = await request.json()
     tg_id = data.get("user_id")
     url = data.get("url")
@@ -174,6 +198,8 @@ async def add_product(request: Request):
     price = data.get("price")
     scheduled_date = data.get("scheduled_date")
     category = data.get("category")  # <-- добавили получение категории из тела запроса
+    
+    print(f"📩 Запрос на добавление товара: {data}")
 
     if not all([tg_id, url, name, scheduled_date]):
         return {"success": False, "error": "Отсутствуют обязательные поля"}
@@ -186,10 +212,10 @@ async def add_product(request: Request):
             return {"success": False, "error": "Пользователь не найден"}
 
         # Проверяем и парсим дату
-        try:
-            scheduled_dt = datetime.fromisoformat(scheduled_date)
-        except ValueError:
-            return {"success": False, "error": "Некорректный формат даты (ожидается ISO)"}
+        scheduled_dt = normalize_datetime(scheduled_date)
+        if not scheduled_dt:
+            return {"success": False, "error": "Некорректная дата (невозможно обработать)"}
+
 
         # 🧩 Парсим товар
         parsed = await parse_wb_product_api(url)
@@ -203,6 +229,7 @@ async def add_product(request: Request):
         main_image = image_url or (parsed.get("images") or [None])[0]
 
         # 🏷 Категория (приоритет: фронт → парсер → запасное значение)
+        categoryTry = data.get("category") 
         final_category = (
             category
             or parsed.get("category")
@@ -210,7 +237,7 @@ async def add_product(request: Request):
             or parsed.get("subject_name")
             or "Не указана"
         )
-        print(f"📦 CATEGORY SELECTED: {final_category}")
+        print(f"📦 CATEGORY SELECTED: {categoryTry}")
 
         # 🧱 Создаём товар
         product = Product(
@@ -245,12 +272,21 @@ async def add_product(request: Request):
         print(f"✅ Товар сохранён (ID={product.id}, Категория={product.category})")
 
         # ⏰ Планируем публикацию
-        scheduler.add_job(
-            publish_product,
-            trigger=DateTrigger(run_date=scheduled_dt),
-            args=[product.id],
-            id=f"publish_{product.id}",
-        )
+        print(f"🕒 Серверное время сейчас: {datetime.now()}")
+        print(f"🕒 scheduled_dt (для job): {scheduled_dt}")
+
+        try:
+            scheduler.add_job(
+                publish_product,
+                trigger=DateTrigger(run_date=scheduled_dt),
+                args=[product.id],
+                id=f"publish_{product.id}",
+                replace_existing=True,  # 👈 чтобы не падало, если такая задача уже есть
+            )
+            print(f"🗓 Задача добавлена: publish_{product.id}")
+        except Exception as e:
+            print(f"⚠️ Не удалось добавить задачу publish_{product.id}: {e}")
+
 
         print(f"🗓 Публикация запланирована на {scheduled_dt}")
 
@@ -332,6 +368,8 @@ async def yookassa_callback(request: Request):
     obj = payload.get("object", {})  # здесь обычно payment
 
     print("💳 YooKassa callback:", event)
+    print("💳 CALLBACK METADATA:", json.dumps(payload, ensure_ascii=False, indent=2))
+
 
     # В разных версиях event'ы называются по-разному, проверим вариант окончания
     if event in ("payment.succeeded", "payment.waiting_for_capture", "payment.captured"):
@@ -347,6 +385,8 @@ async def yookassa_callback(request: Request):
         price = metadata.get("price") or 0
         scheduled_date = metadata.get("scheduled_date")
         category = metadata.get("category")
+        
+        print("💳 CALLBACK METADATA:", metadata)
 
         # Добавляем в БД (если есть все обязательные поля)
         if user_id and url and name and scheduled_date:
@@ -392,11 +432,11 @@ async def add_product_to_db(
             print(f"❌ Пользователь {user_id} не найден при добавлении товара в DB")
             return {"success": False, "error": "Пользователь не найден"}
 
-        try:
-            scheduled_dt = datetime.fromisoformat(scheduled_date)
-        except Exception as e:
-            print(f"❌ Некорректный формат даты: {scheduled_date} ({e})")
-            return {"success": False, "error": "Некорректный формат даты"}
+        scheduled_dt = normalize_datetime(scheduled_date)
+        if not scheduled_dt:
+            print(f"❌ Некорректная дата: {scheduled_date}")
+            return {"success": False, "error": "Некорректная дата"}
+
 
         # Парсим ещё раз, чтобы получить все поля (или можно принимать parsed из frontend)
         parsed = await parse_wb_product_api(url)
@@ -512,3 +552,20 @@ async def admin_stats(
     except Exception as e:
         print(f"❌ Ошибка при вычислении статистики: {e}")
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+    
+
+def normalize_datetime(value):
+    if isinstance(value, str):
+        # 🧠 Убираем Z и заменяем на совместимый с Python формат
+        value = value.replace("Z", "+00:00")
+        try:
+            value = datetime.fromisoformat(value)
+        except Exception:
+            print(f"⚠️ Невозможно распарсить дату: {value}")
+            return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value
+        else:
+            return value.astimezone().replace(tzinfo=None)
+    return value

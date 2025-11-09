@@ -14,8 +14,8 @@ import pytz
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-# WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
-WEB_APP_URL = "https://wb-seller.vercel.app/"
+WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
+# WEB_APP_URL = "https://wb-seller.vercel.app/"
 # BACKEND_URL = "http://localhost:8000"
 BACKEND_URL = "https://api.hikinamuri.ru"
 SUPPORT_USERNAME = "@Hikinamuri"
