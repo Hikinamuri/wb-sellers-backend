@@ -93,10 +93,30 @@ async def create_payment(request: Request):
                 headers={"Idempotence-Key": order_id},
                 json={
                     "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                    "confirmation": {"type": "redirect", "return_url": "https://t.me/WildBerriesSellers_bot"},
+                    "confirmation": {
+                        "type": "redirect",
+                        "return_url": "https://t.me/WildBerriesSellers_bot"
+                    },
                     "capture": True,
                     "description": description,
                     "metadata": safe_meta,
+                    "test"='true',
+                    "receipt": {  # 👇 Обязательно при включённой фискализации
+                        "customer": {
+                            "email": "danya.pochta76@gmail.com",  # или phone
+                        },
+                        "items": [
+                            {
+                                "description": meta.get("name", "Публикация товара"),
+                                "quantity": "1.00",
+                                "amount": {
+                                    "value": f"{amount:.2f}",
+                                    "currency": "RUB"
+                                },
+                                "vat_code": 1  # без НДС
+                            }
+                        ]
+                    }
                 },
                 timeout=10.0,
             )
@@ -109,10 +129,30 @@ async def create_payment(request: Request):
                 headers={"Idempotence-Key": order_id},
                 json={
                     "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                    "confirmation": {"type": "redirect", "return_url": "https://t.me/WildBerriesSellers_bot"},
+                    "confirmation": {
+                        "type": "redirect",
+                        "return_url": "https://t.me/WildBerriesSellers_bot"
+                    },
                     "capture": True,
                     "description": description,
                     "metadata": safe_meta,
+                    "test"='true',
+                    "receipt": {  # 👇 Обязательно при включённой фискализации
+                        "customer": {
+                            "email": "danya.pochta76@gmail.com",  # или phone
+                        },
+                        "items": [
+                            {
+                                "description": meta.get("name", "Публикация товара"),
+                                "quantity": "1.00",
+                                "amount": {
+                                    "value": f"{amount:.2f}",
+                                    "currency": "RUB"
+                                },
+                                "vat_code": 1  # без НДС
+                            }
+                        ]
+                    }
                 },
                 timeout=10.0,
             )
