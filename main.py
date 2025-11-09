@@ -103,37 +103,6 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Ошибка при обращении к бэкенду: {e}")
         await update.message.reply_text("⚠️ Не удалось сохранить контакт в БД.")
 
-async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка данных из Web App"""
-    if update.message.web_app_data:
-        try:
-            data = json.loads(update.message.web_app_data.data)
-            print(f"📦 Данные из Web App: {data}")
-            
-            # Обработка разных типов действий из Web App
-            action = data.get('action')
-            
-            if action == 'create_order':
-                await update.message.reply_text(
-                    "✅ Заказ создан! Товар добавлен в очередь на выкладку.\n\n"
-                    f"🛍️ Товар: {data.get('product_name', 'N/A')}\n"
-                    f"📅 Дата выкладки: {data.get('scheduled_date', 'N/A')}\n"
-                    f"💰 Сумма: {data.get('amount', 'N/A')} руб."
-                )
-            elif action == 'repeat_order':
-                await update.message.reply_text("🔄 Заказ повторен и добавлен в очередь!")
-            elif action == 'parse_product':
-                # Обработка запроса на парсинг
-                product_url = data.get('product_url')
-                if product_url:
-                    await handle_product_parsing(update, product_url)
-            else:
-                await update.message.reply_text("✅ Данные получены!")
-                
-        except Exception as e:
-            print(f"❌ Ошибка обработки данных: {e}")
-            await update.message.reply_text("❌ Ошибка обработки данных от приложения")
-
 async def handle_product_parsing(update: Update, product_url: str):
     """Обработка парсинга товара через API Wildberries"""
     try:
@@ -380,20 +349,16 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     payment = update.message.successful_payment
     print(f"💸 Успешная оплата: {payment.to_dict()}")
 
-    payload = payment.invoice_payload
-
-    # теперь достанем metadata из контекста или базы
-    # если ты отправлял JSON в payload — можно сделать:
-    # meta = json.loads(payload)
-    # но в твоём случае payload = "order_..."
-    # поэтому лучше хранить metadata в боте при отправке инвойса
-
-    # Для простоты: добавь metadata в поле context.user_data перед reply_invoice
+    # payload = payment.invoice_payload  # не используем payload для meta — используем context.user_data
     meta = context.user_data.get("pending_order_meta")
 
     if not meta:
         await update.message.reply_text("⚠️ Не удалось получить данные о заказе.")
         return
+
+    # Убедимся, что category в meta (если нет — попробуем fallback)
+    category = meta.get("category") or meta.get("cat") or meta.get("category_selected") or "Не указана"
+    meta["category"] = category
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -407,6 +372,7 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
                     "image_url": meta.get("image_url"),
                     "price": float(meta.get("price") or 0),
                     "scheduled_date": meta.get("scheduled_date"),
+                    "category": meta.get("category"),
                 },
             ) as resp:
                 result = await resp.json()
@@ -416,7 +382,6 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
             await update.message.reply_text("✅ Оплата получена! Товар добавлен в очередь на выкладку.")
         else:
             await update.message.reply_text(f"⚠️ Оплата успешна, но не удалось добавить товар: {result.get('error')}")
-
     except Exception as e:
         print(f"❌ Ошибка при добавлении товара после оплаты: {e}")
         await update.message.reply_text("❌ Ошибка при добавлении товара в базу.")

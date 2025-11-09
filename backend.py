@@ -86,41 +86,7 @@ async def create_payment(request: Request):
     yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
 
     if not yookassa_secret or not yookassa_account:
-        async with httpx.AsyncClient() as client:
-            yookassa_payment = await client.post(
-                "https://api.yookassa.ru/v3/payments",
-                auth=(yookassa_account, yookassa_secret),
-                headers={"Idempotence-Key": order_id},
-                json={
-                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                    "confirmation": {
-                        "type": "redirect",
-                        "return_url": "https://t.me/WildBerriesSellers_bot"
-                    },
-                    "capture": True,
-                    "description": description,
-                    "metadata": safe_meta,
-                    "test": True,
-                    "receipt": {  # 👇 Обязательно при включённой фискализации
-                        "customer": {
-                            "email": "danya.pochta76@gmail.com",  # или phone
-                        },
-                        "items": [
-                            {
-                                "description": meta.get("name", "Публикация товара"),
-                                "quantity": "1.00",
-                                "amount": {
-                                    "value": f"{amount:.2f}",
-                                    "currency": "RUB"
-                                },
-                                "vat_code": 1  # без НДС
-                            }
-                        ]
-                    }
-                },
-                timeout=10.0,
-            )
-            yookassa_payment = yookassa_payment.json()
+        print("⚠️ Не удалось получить ключи YooKassa")
     else:
         async with httpx.AsyncClient() as client:
             yookassa_payment = await client.post(
@@ -252,7 +218,7 @@ async def add_product(request: Request):
     image_url = data.get("image_url")
     price = data.get("price")
     scheduled_date = data.get("scheduled_date")
-    category = data.get("category")  # <-- добавили получение категории из тела запроса
+    category = data.get("category")
     
     print(f"📩 Запрос на добавление товара: {data}")
 
@@ -423,27 +389,32 @@ async def yookassa_callback(request: Request):
     obj = payload.get("object", {})  # здесь обычно payment
 
     print("💳 YooKassa callback:", event)
-    print("💳 CALLBACK METADATA:", json.dumps(payload, ensure_ascii=False, indent=2))
+    print("💳 CALLBACK RAW:", json.dumps(payload, ensure_ascii=False))
 
-
-    # В разных версиях event'ы называются по-разному, проверим вариант окончания
     if event in ("payment.succeeded", "payment.waiting_for_capture", "payment.captured"):
-        payment = obj.get("payment") or obj  # иногда объект вложен
+        payment = obj.get("payment") or obj
         metadata = payment.get("metadata", {}) if isinstance(payment, dict) else {}
 
-        # Берём поля из metadata (те, что мы положили в create_payment)
+        # Если metadata пришла как строка — попытаться распарсить
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+
+        # Теперь безопасно брать поля
         user_id = metadata.get("user_id") or metadata.get("tg_id")
         url = metadata.get("url")
         name = metadata.get("name")
-        short_desc = metadata.get("short_desc") or ""
-        image_url = metadata.get("image_url") or ""
+        short_desc = metadata.get("description") or metadata.get("short_desc") or ""
+        image_url = metadata.get("image_url", "") or metadata.get("image") or ""
         price = metadata.get("price") or 0
         scheduled_date = metadata.get("scheduled_date")
-        category = metadata.get("category")
-        
-        print("💳 CALLBACK METADATA:", metadata)
+        category = metadata.get("category") or metadata.get("cat") or None
 
-        # Добавляем в БД (если есть все обязательные поля)
+        print("💳 CALLBACK METADATA:", metadata)
+        print("💳 Parsed category:", category)
+
         if user_id and url and name and scheduled_date:
             try:
                 res = await add_product_to_db(
@@ -465,8 +436,8 @@ async def yookassa_callback(request: Request):
         else:
             print("⚠️ Недостаточно данных в metadata для добавления товара:", metadata)
 
-    # Всегда возвращаем 200 OK
     return {"success": True}
+
 
 async def add_product_to_db(
     user_id: str,
