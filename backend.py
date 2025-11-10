@@ -92,6 +92,8 @@ async def create_payment(request: Request):
     yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
     yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
 
+    yookassa_payment = {}
+    
     if not yookassa_secret or not yookassa_account:
         print("⚠️ Не удалось получить ключи YooKassa")
     else:
@@ -145,9 +147,14 @@ async def create_payment(request: Request):
     }
 
 async def publish_product(product_id: int, max_retries: int = 3):
-    """Публикует товар в канал с автопереподключением к БД при обрывах."""
-    from database.db import AsyncSessionLocal  # импорт внутри, чтобы не было циклов
+    """Публикует товар в канал с автопереподключением к БД при обрывах.
+    Если категория = 18+, фото скрывается (спойлерится).
+    """
+    from database.db import AsyncSessionLocal
     from database.models import Product
+    import html
+    from sqlalchemy.exc import OperationalError, InterfaceError
+    import asyncio
 
     for attempt in range(max_retries):
         try:
@@ -171,11 +178,14 @@ async def publish_product(product_id: int, max_retries: int = 3):
                 caption = (
                     f"✅ <b><a href=\"{html.escape(url)}\">{html.escape(name)}</a></b>\n\n"
                     f"💰 <b>Цена со скидкой:</b> {price}\n"
-                    f"💸 <s>Цена старая:{basic_price}</s>\n"
+                    f"💸 <s>Цена старая:</s> {basic_price}\n"
                     f"🛒 <b>Остаток:</b> {stocks} шт.\n"
                     f"📝 <b>Артикул:</b> {wb_id}\n\n"
                     f"#{category.replace(' ', '_')}"
                 )
+
+                # 🔞 Проверяем категорию
+                is_adult = "18" in category or "adult" in category.lower() or "nsfw" in category.lower()
 
                 # 📨 Отправляем пост
                 try:
@@ -185,6 +195,7 @@ async def publish_product(product_id: int, max_retries: int = 3):
                             photo=product.image_url,
                             caption=caption[:1024],
                             parse_mode="HTML",
+                            has_spoiler=is_adult  # 👈 вот тут магия
                         )
                     else:
                         await bot.send_message(
@@ -192,6 +203,7 @@ async def publish_product(product_id: int, max_retries: int = 3):
                             text=caption[:1024],
                             parse_mode="HTML",
                         )
+
                     print(f"✅ Сообщение о товаре {product.id} отправлено в Telegram")
                 except Exception as tg_err:
                     print(f"⚠️ Ошибка Telegram API при публикации {product_id}: {tg_err}")
@@ -216,7 +228,8 @@ async def publish_product(product_id: int, max_retries: int = 3):
         except Exception as e:
             print(f"❌ Неожиданная ошибка при публикации {product_id}: {e}")
             return
-            
+
+       
 @app.post("/api/products/parse")
 async def parse_product(request: Request):
     """
