@@ -178,7 +178,7 @@ async def publish_product(product_id: int, max_retries: int = 3):
                 caption = (
                     f"✅ <b><a href=\"{html.escape(url)}\">{html.escape(name)}</a></b>\n\n"
                     f"💰 <b>Цена со скидкой:</b> {price}\n"
-                    f"💸 <s>Цена старая:</s> {basic_price}\n"
+                    f"💸 <s>Цена старая: {basic_price}\n</s>"
                     f"🛒 <b>Остаток:</b> {stocks} шт.\n"
                     f"📝 <b>Артикул:</b> {wb_id}\n\n"
                     f"#{category.replace(' ', '_')}"
