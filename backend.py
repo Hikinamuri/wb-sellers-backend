@@ -109,6 +109,7 @@ async def create_payment(request: Request):
                         "return_url": "https://t.me/WildBerriesSellers_bot"
                     },
                     "capture": True,
+                    "test": False,
                     "description": description,
                     "metadata": safe_meta,
                     "receipt": {  # 👇 Обязательно при включённой фискализации
