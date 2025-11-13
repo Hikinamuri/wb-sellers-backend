@@ -123,7 +123,7 @@ async def create_payment(request: Request):
                                     "value": f"{amount:.2f}",
                                     "currency": "RUB"
                                 },
-                                "vat_code": 1  # без НДС
+                                "vat_code": 1,
                                 "payment_subject": "service",
                                 "payment_mode": "full_payment"  
                             }
