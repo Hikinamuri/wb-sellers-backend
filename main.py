@@ -15,12 +15,14 @@ import base64
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-# WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
-WEB_APP_URL = "https://wb-seller.vercel.app/"
+# WEB_APP_URL = "https://wb-seller.vercel.app/"
+WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
 # BACKEND_URL = "http://localhost:8000"
 BACKEND_URL = "https://api.hikinamuri.ru"
-SUPPORT_USERNAME = "@Hikinamuri"
-CHANNEL_ID = '@wbsellers_test'
+SUPPORT_USERNAME = "@ekzoskidki7"
+# CHANNEL_ID = '@wbsellers_test'
+CHANNEL_ID = '@testkoc'
+
 # 🔐 Список Telegram ID администраторов
 ADMIN_IDS = {933791537, 455197004, 810503099, 535437088}  # замени на свои tg_id
 
@@ -179,38 +181,6 @@ def format_api_product_message(product_data: dict) -> str:
     
     return message
 
-def format_product_message(product_data: dict) -> str:
-    """Форматирование сообщения с информацией о товаре"""
-    name = product_data.get('name', 'Неизвестно')
-    price = product_data.get('price', 0)
-    description = product_data.get('description', 'Описание отсутствует')
-    rating = product_data.get('rating', 0)
-    reviews_count = product_data.get('reviews_count', 0)
-    seller = product_data.get('seller', 'Неизвестно')
-    
-    message = (
-        f"🛍️ <b>Информация о товаре</b>\n\n"
-        f"<b>Название:</b> {name}\n"
-        f"<b>Цена:</b> {price} руб.\n"
-        f"<b>Продавец:</b> {seller}\n"
-    )
-    
-    if rating > 0:
-        message += f"<b>Рейтинг:</b> {rating} ⭐\n"
-    
-    if reviews_count > 0:
-        message += f"<b>Отзывы:</b> {reviews_count}\n"
-    
-    message += f"\n<b>Описание:</b>\n{description[:300]}..."
-    
-    # Добавляем характеристики если они есть
-    characteristics = product_data.get('characteristics', {})
-    if characteristics:
-        message += f"\n\n<b>Основные характеристики:</b>"
-        for key, value in list(characteristics.items())[:3]:  # Показываем первые 3
-            message += f"\n• {key}: {value}"
-    
-    return message
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -255,7 +225,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "🛠 Тех. поддержка":
         await update.message.reply_text(
-            f"📞 По всем вопросам обращайтесь: {SUPPORT_USERNAME}\n\n"
+            f"📞 По всем вопросам обращайтесь: {SUPPORT_USERNAME} или на почту vitya.starikov.2001@mail.ru\n\n"
             "Мы поможем с:\n"
             "• Настройкой бота\n"
             "• Проблемами с выкладкой\n"
@@ -315,14 +285,17 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             if data.get("yookassa_payment_id"):
                 pending_meta["yookassa_payment_id"] = data.get("yookassa_payment_id")
             # сохраняем весь meta в память бота (временно, для обработки successful_payment)
-            context.user_data["pending_order_meta"] = pending_meta
+            payload = data.get("payload")
+            if payload:
+                context.user_data.setdefault("pending_orders", {})[payload] = pending_meta
+
             # -------------------------------------------------------------------------
 
             await update.message.reply_invoice(
                 title=data["title"],
                 description=data["description"],
                 payload=data["payload"],
-                provider_token="381764678:TEST:150197",
+                provider_token="390540012:LIVE:82251",
                 currency=data["currency"],
                 prices=prices,
                 start_parameter="publish",
@@ -355,16 +328,12 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = update.message.successful_payment
-    print(f"💸 Успешная оплата: {payment.to_dict()}")
+    payload = payment.invoice_payload
+    pending_orders = context.user_data.get("pending_orders", {})
+    pending_meta = pending_orders.get(payload, {}) or {}
 
-    # Берём сохранённый meta (тот, что мы положили в handle_web_app_data)
-    pending_meta = context.user_data.get("pending_order_meta", {}) or {}
-
-    # Предпочитаем yookassa_payment_id из pending_meta (тот, что создал backend)
     yk_id = pending_meta.get("yookassa_payment_id")
 
-    # Если yk_id нет — можно попытаться использовать provider_payment_charge_id как fallback,
-    # но это часто НЕ ДАЁТ нужных metadata (см. обсуждение).
     if not yk_id:
         print("⚠️ yookassa_payment_id не найден в context.user_data, пробуем provider_payment_charge_id как fallback")
         yk_id = payment.provider_payment_charge_id
@@ -429,6 +398,8 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
 
         if result.get("success"):
             await update.message.reply_text("✅ Оплата подтверждена! Товар добавлен в очередь на выкладку.")
+            if payload in pending_orders:
+                del pending_orders[payload]
         else:
             await update.message.reply_text(f"⚠️ Оплата прошла, но не удалось добавить товар: {result.get('error')}")
     except Exception as e:
