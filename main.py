@@ -295,7 +295,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
                 title=data["title"],
                 description=data["description"],
                 payload=data["payload"],
-                provider_token="390540012:LIVE:82251",
+                provider_token="390540012:LIVE:82345",
                 currency=data["currency"],
                 prices=prices,
                 start_parameter="publish",
