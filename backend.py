@@ -438,51 +438,6 @@ async def yookassa_callback(request: Request):
     print("💳 YooKassa callback:", event)
     print("💳 CALLBACK RAW:", json.dumps(payload, ensure_ascii=False))
 
-    if event in ("payment.succeeded", "payment.waiting_for_capture", "payment.captured"):
-        payment = obj.get("payment") or obj
-        metadata = payment.get("metadata", {}) if isinstance(payment, dict) else {}
-
-        # Если metadata пришла как строка — попытаться распарсить
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except Exception:
-                metadata = {}
-
-        # Теперь безопасно брать поля
-        user_id = metadata.get("user_id") or metadata.get("tg_id")
-        url = metadata.get("url")
-        name = metadata.get("name")
-        short_desc = metadata.get("description") or metadata.get("short_desc") or ""
-        image_url = metadata.get("image_url", "") or metadata.get("image") or ""
-        price = metadata.get("price") or 0
-        scheduled_date = metadata.get("scheduled_date")
-        category = metadata.get("category") or metadata.get("cat") or None
-
-        print("💳 CALLBACK METADATA:", metadata)
-        print("💳 Parsed category:", category)
-
-        if user_id and url and name and scheduled_date:
-            try:
-                res = await add_product_to_db(
-                    user_id=user_id,
-                    url=url,
-                    name=name,
-                    description=short_desc,
-                    image_url=image_url,
-                    price=float(price) if price else 0,
-                    scheduled_date=scheduled_date,
-                    category=category,
-                )
-                if res.get("success"):
-                    print("✅ Товар добавлен в БД после оплаты")
-                else:
-                    print("❌ Не получилось добавить товар после оплаты:", res)
-            except Exception as e:
-                print("❌ Ошибка при добавлении товара после оплаты:", e)
-        else:
-            print("⚠️ Недостаточно данных в metadata для добавления товара:", metadata)
-
     return {"success": True}
 
 

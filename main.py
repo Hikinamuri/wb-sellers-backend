@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import pytz
 import calendar
 import base64
+import json as _json
 
 load_dotenv()
 
@@ -279,28 +280,63 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
         if data.get("success") and "prices" in data:
             prices = [LabeledPrice(**p) for p in data["prices"]]
 
-            # --- Сохраняем в context и явно добавляем yookassa_payment_id (если есть) ---
+            # --- Сохраняем meta и id платежа ЮKassa ---
             pending_meta = data.get("metadata", {}) or {}
-            # если backend вернул yookassa_payment_id — сохраняем его
             if data.get("yookassa_payment_id"):
                 pending_meta["yookassa_payment_id"] = data.get("yookassa_payment_id")
-            # сохраняем весь meta в память бота (временно, для обработки successful_payment)
+
             payload = data.get("payload")
             if payload:
                 context.user_data.setdefault("pending_orders", {})[payload] = pending_meta
 
-            # -------------------------------------------------------------------------
+            # -----------------------------------------------------
+            #  Формируем provider_data для ЮKassa (обязателен чек)
+            # -----------------------------------------------------
+
+            amount_cop = data["prices"][0]["amount"]  # сумма в копейках для Telegram
+            amount_rub = amount_cop / 100.0           # сумма в рублях для ЮKassa receipt
+
+            provider_data = {
+                "receipt": {
+                    # Telegram сам запросит email у пользователя
+                    "items": [
+                        {
+                            "description": data.get("description", "")[:128],
+                            "quantity": "1.00",
+                            "amount": {
+                                "value": f"{amount_rub:.2f}",  # РУБЛИ
+                                "currency": "RUB"
+                            },
+                            "vat_code": 1,                    # 1 = без НДС (чаще всего ИП на НПД/УСН)
+                            "payment_mode": "full_payment",
+                            "payment_subject": "service",      # твоё размещение товара = услуга
+                        }
+                    ],
+                    "tax_system_code": 1  # 1 = ОСН, 2 = УСН доходы, 3 = УСН доходы-расходы
+                }
+            }
+
+            import json as _json
+
+            # -----------------------------------------------------
+            #  Отправка инвойса Telegram API с чеком ЮKassa
+            # -----------------------------------------------------
 
             await update.message.reply_invoice(
                 title=data["title"],
                 description=data["description"],
                 payload=data["payload"],
-                provider_token="390540012:LIVE:82345",
+                provider_token="390540012:LIVE:82345",  # твой live токен
                 currency=data["currency"],
                 prices=prices,
+
                 start_parameter="publish",
+
                 need_name=True,
-                need_phone_number=True,
+                need_email=True,                 # <— включаем email для чека
+                send_email_to_provider=True,     # <— Telegram отправит email в ЮKassa
+
+                provider_data=_json.dumps(provider_data, ensure_ascii=False)
             )
             return
 
