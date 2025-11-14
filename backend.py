@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = "@wbsellers_test"  # или твой канал
+CHANNEL_ID = "@ekzoskidki" 
 TELEGRAM_PROVIDER_TOKEN=os.getenv("TELEGRAM_PROVIDER_TOKEN")
 
 bot = Bot(token=BOT_TOKEN)

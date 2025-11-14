@@ -16,13 +16,13 @@ import json as _json
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-# WEB_APP_URL = "https://wb-seller.vercel.app/"
-WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
+WEB_APP_URL = "https://wb-seller.vercel.app/"
+# WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
 # BACKEND_URL = "http://localhost:8000"
 BACKEND_URL = "https://api.hikinamuri.ru"
 SUPPORT_USERNAME = "@ekzoskidki7"
 # CHANNEL_ID = '@wbsellers_test'
-CHANNEL_ID = '@testkoc'
+CHANNEL_ID = '@ekzoskidki'
 
 # 🔐 Список Telegram ID администраторов
 ADMIN_IDS = {933791537, 455197004, 810503099, 535437088}  # замени на свои tg_id
