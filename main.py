@@ -12,6 +12,9 @@ import pytz
 import calendar
 import base64
 import json as _json
+import time
+import uuid
+import logging
 
 load_dotenv()
 
@@ -24,6 +27,7 @@ SUPPORT_USERNAME = "@ekzoskidki7"
 # CHANNEL_ID = '@wbsellers_test'
 CHANNEL_ID = '@ekzoskidki'
 PENDING_MESSAGES = {}
+SENT_INVOICES = {}   
 
 # 🔐 Список Telegram ID администраторов
 ADMIN_IDS = {933791537, 455197004, 810503099, 535437088}  # замени на свои tg_id
@@ -72,6 +76,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(greeting, parse_mode="HTML", reply_markup=reply_markup)
 
+def generate_unique_payload(base_id):
+    return f"{base_id}_{uuid.uuid4().hex[:8]}_{int(time.time())}"
 
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка shared контакта"""
@@ -268,88 +274,158 @@ def get_parsed_product(user_id: int) -> dict:
     """Получение результатов парсинга для пользователя"""
     return parsing_cache.get(f"product_{user_id}")
 
+
+async def cancel_all_pending_invoices(context, chat_id):
+    """Удаляет ВСЕ висящие инвойсы у пользователя"""
+    to_remove = []
+
+    for payload, info in SENT_INVOICES.items():
+        if info["chat_id"] == chat_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=info["message_id"]
+                )
+                print(f"🗑 Removed pending invoice msg={info['message_id']} payload={payload}")
+                to_remove.append(payload)
+            except Exception as e:
+                print(f"⚠️ Could not remove invoice {payload}: {e}")
+
+    # Чистим словарь
+    for payload in to_remove:
+        SENT_INVOICES.pop(payload, None)
+  
+        
 async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка данных из Web App"""
-    if not update.message.web_app_data:
+    """Обработка данных из Web App — с подробным логированием invoice"""
+    if not update.message or not update.message.web_app_data:
         return
 
     try:
         data = json.loads(update.message.web_app_data.data)
-        print(f"📦 Данные из Web App: {data}")
+        print("📦 WebApp data received:", data)
 
-        # Если это данные для оплаты — создаём инвойс
+        # ==========================
+        #  ОБРАБОТКА ОПЛАТЫ
+        # ==========================
         if data.get("success") and "prices" in data:
+            await cancel_all_pending_invoices(context, update.effective_chat.id)
+            context.user_data["pending_orders"] = {}
+
+            # --- базовый payload от фронта ---
+            raw_key = data.get("payload") or "order"
+
+            # --- создаём полностью уникальный payload ---
+            unique_part = f"{uuid.uuid4().hex[:8]}_{int(time.time())}"
+            payload = generate_unique_payload(raw_key)
+            data["payload"] = payload
+            
+            print(f"🔐 Generated payload via function: {payload}")
+
+            # =================================================
+            #   УДАЛЯЕМ старый invoice, если он был ранее
+            # =================================================
+            old = PENDING_MESSAGES.get(raw_key)
+            if old:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=old["chat_id"],
+                        message_id=old["message_id"]
+                    )
+                    print(f"🗑 Deleted old invoice message {old['message_id']} for key {raw_key}")
+                except Exception as e:
+                    print(f"⚠️ Could not delete old invoice {old}: {e}")
+
+                PENDING_MESSAGES.pop(raw_key, None)
+
+            # ==========================
+            #  ФОРМИРУЕМ ЧЕК ЮКАССЫ
+            # ==========================
             prices = [LabeledPrice(**p) for p in data["prices"]]
 
-            # --- Сохраняем meta и id платежа ЮKassa ---
-            pending_meta = data.get("metadata", {}) or {}
-            if data.get("yookassa_payment_id"):
-                pending_meta["yookassa_payment_id"] = data.get("yookassa_payment_id")
+            amount_cop = data["prices"][0]["amount"]
+            amount_rub = amount_cop / 100
 
-            payload = data.get("payload")
-            if payload:
-                context.user_data.setdefault("pending_orders", {})[payload] = pending_meta
-
-            # -----------------------------------------------------
-            #  Формируем provider_data для ЮKassa (обязателен чек)
-            # -----------------------------------------------------
-
-            amount_cop = data["prices"][0]["amount"]  # сумма в копейках для Telegram
-            amount_rub = amount_cop / 100.0           # сумма в рублях для ЮKassa receipt
+            base_desc = data.get("description", "")[:110]  # оставляем запас для хвоста
+            unique_suffix = uuid.uuid4().hex[:6]          # уникальный короткий ID
+            receipt_description = f"{base_desc} | {unique_suffix}"  # ← уникальна для каждого вызова
 
             provider_data = {
                 "receipt": {
-                    # Telegram сам запросит email у пользователя
                     "items": [
                         {
-                            "description": data.get("description", "")[:128],
+                            "description": receipt_description,
                             "quantity": "1.00",
                             "amount": {
-                                "value": f"{amount_rub:.2f}",  # РУБЛИ
+                                "value": f"{amount_rub:.2f}",
                                 "currency": "RUB"
                             },
-                            "vat_code": 1,                    # 1 = без НДС (чаще всего ИП на НПД/УСН)
+                            "vat_code": 1,
                             "payment_mode": "full_payment",
-                            "payment_subject": "service",      # твоё размещение товара = услуга
+                            "payment_subject": "service",
                         }
                     ],
-                    "tax_system_code": 1  # 1 = ОСН, 2 = УСН доходы, 3 = УСН доходы-расходы
+                    "tax_system_code": 1
                 }
             }
 
-            import json as _json
+            # ==========================
+            #  СОХРАНЯЕМ МЕТАДАННЫЕ ПЛАТЕЖА
+            # ==========================
+            pending_meta = data.get("metadata", {}) or {}
+            if data.get("yookassa_payment_id"):
+                pending_meta["yookassa_payment_id"] = data["yookassa_payment_id"]
 
+            # сохраняем meta по УНИКАЛЬНОМУ payload
+            context.user_data.setdefault("pending_orders", {})[payload] = {
+                **pending_meta,
+                "raw_key": raw_key
+            }
+
+            # ==========================
+            #  ОТПРАВЛЯЕМ INVOICE
+            # ==========================
             sent = await update.message.reply_invoice(
                 title=data["title"],
                 description=data["description"],
-                payload=data["payload"],
-                provider_token="390540012:LIVE:82345",  # твой live токен
+                payload=payload,
+                provider_token=os.getenv("TELEGRAM_PROVIDER_TOKEN") or "390540012:LIVE:82345",
                 currency=data["currency"],
                 prices=prices,
-
                 start_parameter="publish",
-
                 need_name=True,
-                need_email=True,                 # <— включаем email для чека
-                send_email_to_provider=True,     # <— Telegram отправит email в ЮKassa
-
-                provider_data=_json.dumps(provider_data, ensure_ascii=False)
+                need_email=True,
+                send_email_to_provider=True,
+                provider_data=json.dumps(provider_data, ensure_ascii=False),
             )
-            PENDING_MESSAGES[data["payload"]] = sent.message_id
+
+            # ==========================
+            #  РЕГИСТРАЦИЯ ОТПРАВЛЕННОГО ИНВОЙСА
+            # ==========================
+            info = {
+                "chat_id": update.effective_chat.id,
+                "message_id": sent.message_id,
+                "ts": int(time.time()),
+                "provider_data": provider_data,
+                "raw_key": raw_key,
+            }
+
+            PENDING_MESSAGES[raw_key] = info
+            SENT_INVOICES[payload] = info
+
+            print(f"✅ Sent invoice. payload={payload} chat={info['chat_id']} msg={info['message_id']}")
             return
 
-        action = data.get('action')
+        # ==========================
+        #  ОСТАЛЬНЫЕ ДЕЙСТВИЯ WEB-APP
+        # ==========================
+        action = data.get("action")
 
-        if action == 'create_order':
-            await update.message.reply_text(
-                f"✅ Заказ создан!\n"
-                f"🛍️ {data.get('product_name', 'N/A')}\n"
-                f"📅 {data.get('scheduled_date', 'N/A')}\n"
-                f"💰 {data.get('amount', 'N/A')} руб."
-            )
+        if action == "create_order":
+            await update.message.reply_text(f"✅ Заказ создан!\n🛍️ {data.get('product_name','N/A')}")
 
-        elif action == 'parse_product':
-            product_url = data.get('product_url')
+        elif action == "parse_product":
+            product_url = data.get("product_url")
             if product_url:
                 await handle_product_parsing(update, product_url)
 
@@ -357,7 +433,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("✅ Данные получены!")
 
     except Exception as e:
-        print(f"❌ Ошибка обработки WebApp данных: {e}")
+        print(f"❌ Error handling WebApp data: {e}")
         await update.message.reply_text("❌ Ошибка обработки данных от приложения")
 
 async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,6 +452,15 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
     yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
 
+    message = update.message or \
+        (update.callback_query.message if update.callback_query else None)
+    if not message:
+        print("⚠️ successful_payment пришёл, но message нет!")
+        return
+
+    payment = message.successful_payment
+    print("🎉 PAYMENT DATA:", payment.to_dict())
+        
     # Если есть yk_id и креды — делаем запрос в YooKassa, чтобы получить официальные metadata
     remote_meta = {}
     if yk_id and yookassa_account and yookassa_secret:
@@ -443,12 +528,39 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     try:
-        # Здесь можно проверить, корректен ли заказ, цена, payload и т.д.
-        await query.answer(ok=True)
-        print(f"✅ PreCheckout подтверждён: {query.invoice_payload}")
+        invoice_payload = query.invoice_payload
+        print(f"➡️ PreCheckout received. invoice_payload={invoice_payload} from user={query.from_user.id}")
+
+        # логируем соответствие сохранённых инвойсов
+        sent = SENT_INVOICES.get(invoice_payload)
+        if sent:
+            print(f"🔎 Matched sent invoice: {sent}")
+            # можно дополнительно проверить возраст инвойса
+            age = int(time.time()) - sent["ts"]
+            if age > 60 * 15:  # 15 минут
+                print("⚠️ Invoice older than 15min, rejecting precheckout to force new flow.")
+                await query.answer(ok=False, error_message="Срок формы оплаты истёк — откройте форму снова.")
+                return
+
+            # всё ок — подтверждаем
+            await query.answer(ok=True)
+            print(f"✅ PreCheckout confirmed: {invoice_payload}")
+        else:
+            # Нет соответствия — логируем ВАЖНО и НЕ подтверждаем, чтобы не создавать неотслеживаемые оплаты
+            print(f"❌ PreCheckout payload NOT FOUND in SENT_INVOICES! payload={invoice_payload}")
+            # Включаем подробное состояние pending keys
+            print("CURRENT PENDING_KEYS:", list(PENDING_MESSAGES.keys()))
+            print("CURRENT SENT_PAYLOADS:", list(SENT_INVOICES.keys())[:50])
+            # можно временно ответить false, чтобы клиент увидел ошибку и не продолжал
+            await query.answer(ok=False, error_message="Не найдено соответствие инвойсу. Откройте оплату снова.")
+            return
+
     except Exception as e:
         print(f"❌ Ошибка precheckout: {e}")
-        await query.answer(ok=False, error_message="Ошибка при подготовке оплаты. Попробуйте снова.")
+        try:
+            await query.answer(ok=False, error_message="Ошибка при подготовке оплаты. Попробуйте снова.")
+        except Exception:
+            pass
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню статистики (выбор месяца или день)"""
@@ -666,6 +778,9 @@ async def debug_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         
 
+async def remove_webhook_before_start(application):
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
 if __name__ == "__main__":
     print("🚀 Запускаю бота для Wildberries...")
     print(f"🔑 Токен: {BOT_TOKEN[:10]}...")
@@ -673,15 +788,15 @@ if __name__ == "__main__":
     print(f"📞 Поддержка: {SUPPORT_USERNAME}")
     
     try:
-        app = Application.builder().token(BOT_TOKEN).build()
+        app = Application.builder().token(BOT_TOKEN).post_init(remove_webhook_before_start).build()
         
         # Обработчики
         app.add_handler(CommandHandler("start", start))
         app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
         app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
         app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
         app.add_handler(CommandHandler("stats", admin_stats))
         app.add_handler(CommandHandler("stats", admin_stats))
         app.add_handler(CommandHandler("debug_channel", debug_channel))
@@ -692,6 +807,7 @@ if __name__ == "__main__":
 
         
         print("✅ Бот запущен!")
-        app.run_polling()
+        logging.basicConfig(level=logging.DEBUG)
+        app.run_polling(allowed_updates=Update.ALL_TYPES, poll_interval=0.3)
     except Exception as e:
         print(f"❌ Ошибка: {e}")
