@@ -88,11 +88,57 @@ async def create_payment(request: Request):
 
     print("🧾 SAFE META:", safe_meta)
 
-    # --- УБРАНО: предварительное создание платежа в YooKassa ---
-    # Если вам не критично иметь внешний yookassa id до отправки telegram invoice,
-    # лучше его не создавать: телеграм провайдер сам обработает оплату.
+    # ⚙️ Создаём платёж в YooKassa (тест или боевой режим)
+    yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
+    yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
 
-    return {
+    yookassa_payment = {}
+    
+    if not yookassa_secret or not yookassa_account:
+        print("⚠️ Не удалось получить ключи YooKassa")
+    else:
+        async with httpx.AsyncClient() as client:
+            yookassa_payment = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                auth=(yookassa_account, yookassa_secret),
+                headers={"Idempotence-Key": order_id},
+                json={
+                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+                    "confirmation": {
+                        "type": "redirect",
+                        "return_url": "https://t.me/WildBerriesSellers_bot"
+                    },
+                    "capture": True,
+                    "test": False,
+                    "description": description,
+                    "metadata": safe_meta,
+                    "receipt": {  # 👇 Обязательно при включённой фискализации
+                        "customer": {
+                            "email": "danya.pochta76@gmail.com",  # или phone
+                        },
+                        "items": [
+                            {
+                                "description": meta.get("name", "Публикация товара"),
+                                "quantity": "1.00",
+                                "amount": {
+                                    "value": f"{amount:.2f}",
+                                    "currency": "RUB"
+                                },
+                                "vat_code": 1,
+                                "payment_subject": "service",
+                                "payment_mode": "full_payment"  
+                            }
+                        ]
+                    }
+                },
+                timeout=10.0,
+            )
+            yookassa_payment = yookassa_payment.json()
+
+    # 🧠 Возвращаем данные для Telegram Bot API
+    payment_id = yookassa_payment.get("id")
+    
+     return {
         "success": True,
         "payload": f"order_{order_id}",
         "title": title,
@@ -101,7 +147,12 @@ async def create_payment(request: Request):
         "prices": prices,
         "provider_token": os.getenv("TELEGRAM_PROVIDER_TOKEN"),
         "metadata": safe_meta,
-        "yookassa_payment_id": None,  # явно None — чтобы бот не пытался работать с ним
+
+        "provider_data": {
+            "yookassa_payment_id": payment_id
+        },
+
+        "yookassa_payment_id": payment_id,
     }
 
 async def publish_product(product_id: int, max_retries: int = 3):
@@ -404,7 +455,7 @@ async def yookassa_callback(request: Request):
             # Отправляем в Telegram сообщение об отмене
             try:
                 from telegram import Bot
-                bot = Bot("<BOT_TOKEN_HERE>")
+                bot = Bot(BOT_TOKEN)
 
                 await bot.send_message(
                     chat_id=int(user_id),

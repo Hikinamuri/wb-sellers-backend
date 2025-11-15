@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from new_parser import parse_wb_product_api
 import aiohttp
 from telegram import LabeledPrice
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
 import calendar
 import base64
@@ -34,6 +34,47 @@ ADMIN_IDS = {933791537, 455197004, 810503099, 535437088}  # замени на с
 
 # Кэш для хранения результатов парсинга
 parsing_cache = {}
+
+# --- Конфиг для YooKassa (из env) ---
+YOOKASSA_ACCOUNT = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_SECRET = os.getenv("YOOKASSA_SECRET_KEY")
+
+# Порог возраста YK-платежа (в секундах), старше которого мы пытаемся отменить чтобы избежать duplicate.
+YK_AGE_CANCEL_THRESHOLD = int(os.getenv("YK_AGE_CANCEL_THRESHOLD", "60"))  # дефолт 60s
+
+# ---------- Вспомогательные функции для YooKassa ----------
+async def fetch_yk_payment(payment_id: str) -> dict | None:
+    """Получить информацию о платеже в YooKassa по id. Возвращает JSON или None при ошибке."""
+    if not (YOOKASSA_ACCOUNT and YOOKASSA_SECRET and payment_id):
+        return None
+    try:
+        auth = aiohttp.BasicAuth(YOOKASSA_ACCOUNT, YOOKASSA_SECRET)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.yookassa.ru/v3/payments/{payment_id}", auth=auth, timeout=10.0) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    text = await resp.text()
+                    print(f"⚠️ YooKassa fetch returned {resp.status}: {text}")
+    except Exception as e:
+        print(f"❌ Ошибка fetch_yk_payment: {e}")
+    return None
+
+async def cancel_yk_payment(payment_id: str) -> tuple[int, str]:
+    """Попытаться отменить платеж в YooKassa. Возвращает (status_code, response_text)."""
+    if not (YOOKASSA_ACCOUNT and YOOKASSA_SECRET and payment_id):
+        return (0, "missing_credentials_or_id")
+    try:
+        auth = aiohttp.BasicAuth(YOOKASSA_ACCOUNT, YOOKASSA_SECRET)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"https://api.yookassa.ru/v3/payments/{payment_id}/cancel", auth=auth, timeout=10.0) as resp:
+                text = await resp.text()
+                return (resp.status, text)
+    except Exception as e:
+        print(f"❌ Ошибка cancel_yk_payment: {e}")
+        return (0, str(e))
+
+# ---------- Конец вспомогательных функций ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -279,7 +320,7 @@ async def cancel_all_pending_invoices(context, chat_id):
     """Удаляет ВСЕ висящие инвойсы у пользователя"""
     to_remove = []
 
-    for payload, info in SENT_INVOICES.items():
+    for payload, info in list(SENT_INVOICES.items()):
         if info["chat_id"] == chat_id:
             try:
                 await context.bot.delete_message(
@@ -295,7 +336,7 @@ async def cancel_all_pending_invoices(context, chat_id):
     for payload in to_remove:
         SENT_INVOICES.pop(payload, None)
   
-        
+
 async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка данных из Web App — с подробным логированием invoice"""
     if not update.message or not update.message.web_app_data:
@@ -316,7 +357,6 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             raw_key = data.get("payload") or "order"
 
             # --- создаём полностью уникальный payload ---
-            unique_part = f"{uuid.uuid4().hex[:8]}_{int(time.time())}"
             payload = generate_unique_payload(raw_key)
             data["payload"] = payload
             
@@ -339,7 +379,60 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
                 PENDING_MESSAGES.pop(raw_key, None)
 
             # ==========================
-            #  ФОРМИРУЕМ ЧЕК ЮКАССЫ
+            #  Проверяем переданный yookassa_payment_id (если есть)
+            #  и пытаемся отменить старый pending-платеж, чтобы избежать duplicate
+            # ==========================
+            incoming_yk = data.get("yookassa_payment_id")
+            accepted_yk = None
+
+            if incoming_yk:
+                print("ℹ️ WebApp provided yookassa_payment_id:", incoming_yk)
+                yk_info = await fetch_yk_payment(incoming_yk)
+                if not yk_info:
+                    print("⚠️ Не удалось получить данные по YooKassa платежу или креды отсутствуют — игнорируем incoming id")
+                else:
+                    yk_status = yk_info.get("status")
+                    created_at = yk_info.get("created_at")
+                    print(f"ℹ️ YooKassa status={yk_status}, created_at={created_at} for id={incoming_yk}")
+
+                    # Попробуем вычислить возраст платежа (в сек)
+                    age_seconds = None
+                    if created_at:
+                        try:
+                            # fromisoformat может парсить +00:00, если есть Z — заменим
+                            created_norm = created_at.replace("Z", "+00:00")
+                            created_dt = datetime.fromisoformat(created_norm)
+                            now_utc = datetime.now(timezone.utc)
+                            # если created_dt не имеет tzinfo, считаем как UTC
+                            if created_dt.tzinfo is None:
+                                created_dt = created_dt.replace(tzinfo=timezone.utc)
+                            age_seconds = (now_utc - created_dt).total_seconds()
+                        except Exception as e:
+                            print("⚠️ Не удалось распарсить created_at:", e)
+
+                    # Логика: если статус pending/waiting_for_capture и возраст > threshold -> отменяем
+                    if yk_status in ("pending", "waiting_for_capture"):
+                        if age_seconds is None:
+                            print("⚠️ Не удалось получить возраст платежа — по безопасности игнорируем incoming id")
+                        else:
+                            print(f"ℹ️ YooKassa payment age={age_seconds:.1f}s (threshold={YK_AGE_CANCEL_THRESHOLD}s)")
+                            if age_seconds > YK_AGE_CANCEL_THRESHOLD:
+                                code, text = await cancel_yk_payment(incoming_yk)
+                                print(f"🗑 Cancel attempt for {incoming_yk} -> {code} {text}")
+                                # не сохраняем incoming id (он отменён)
+                            else:
+                                # Если платёж совсем свежий (< threshold), чтобы избежать race — лучше не переиспользовать старый id,
+                                # т.к. submit duplicate может появиться при повторном использовании. Решение: **не сохраняем** incoming id
+                                print("⚠️ YooKassa payment is fresh but to avoid duplicates we will ignore incoming id and let Telegram create a new one.")
+                    elif yk_status in ("succeeded", "succeeded_by_provider", "captured"):
+                        # Теоретически можно принять, но чаще всего это не случится в момент создания invoice — логируем и принимаем
+                        accepted_yk = incoming_yk
+                        print("✅ YooKassa payment already succeeded — accepting incoming id.")
+                    else:
+                        print("⚠️ YooKassa payment in unexpected status -> ignoring:", yk_status)
+
+            # ==========================
+            #  ФОРМИРУЕМ ЧЕК ЮКАССЫ (local provider_data для Telegram)
             # ==========================
             prices = [LabeledPrice(**p) for p in data["prices"]]
 
@@ -370,11 +463,15 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             }
 
             # ==========================
-            #  СОХРАНЯЕМ МЕТАДАННЫЕ ПЛАТЕЖА
+            #  СОХРАНЯЕМ МЕТАДАННЫЕ ПЛАТЕЖА (но НЕ вслепую incoming yk id)
             # ==========================
             pending_meta = data.get("metadata", {}) or {}
-            if data.get("yookassa_payment_id"):
-                pending_meta["yookassa_payment_id"] = data["yookassa_payment_id"]
+            if accepted_yk:
+                pending_meta["yookassa_payment_id"] = accepted_yk
+            else:
+                # чтобы избежать дубликатов, явно не сохраняем incoming yk id
+                if data.get("yookassa_payment_id"):
+                    print("ℹ️ Ignoring incoming yookassa_payment_id to avoid duplicate submits.")
 
             # сохраняем meta по УНИКАЛЬНОМУ payload
             context.user_data.setdefault("pending_orders", {})[payload] = {
@@ -398,6 +495,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
                 send_email_to_provider=True,
                 provider_data=json.dumps(provider_data, ensure_ascii=False),
             )
+
 
             # ==========================
             #  РЕГИСТРАЦИЯ ОТПРАВЛЕННОГО ИНВОЙСА
@@ -439,7 +537,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = update.message.successful_payment
     payload = payment.invoice_payload
-    pending_orders = context.user_data.get("pending_orders", {})
+    pending_orders = context.user_data.get("pending_orders", {}) or {}
     pending_meta = pending_orders.get(payload, {}) or {}
 
     yk_id = pending_meta.get("yookassa_payment_id")
