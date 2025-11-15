@@ -153,7 +153,7 @@ async def create_payment(request: Request):
             },
 
             "yookassa_payment_id": payment_id,
-    }
+        }
 
 async def publish_product(product_id: int, max_retries: int = 3):
     """Публикует товар в канал с автопереподключением к БД при обрывах.
