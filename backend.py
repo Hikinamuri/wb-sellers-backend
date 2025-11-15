@@ -433,12 +433,49 @@ async def get_user_products(tg_id: str, session: AsyncSession = Depends(get_sess
 async def yookassa_callback(request: Request):
     payload = await request.json()
     event = payload.get("event")
-    obj = payload.get("object", {})  # здесь обычно payment
+    obj = payload.get("object", {})  
 
     print("💳 YooKassa callback:", event)
     print("💳 CALLBACK RAW:", json.dumps(payload, ensure_ascii=False))
 
+    # ==== Обработка отмены платежа ====
+    if event == "payment.canceled":
+        metadata = obj.get("metadata", {})
+        user_id = metadata.get("user_id")
+        order_id = metadata.get("order_id")
+
+        if user_id:
+            # Отправляем в Telegram сообщение об отмене
+            try:
+                from telegram import Bot
+                bot = Bot("<BOT_TOKEN_HERE>")
+
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text=(
+                        "⛔ <b>Оплата отменена</b>\n"
+                        "Вы можете попробовать снова."
+                    ),
+                    parse_mode="HTML"
+                )
+
+                # Удаляем сообщение с кнопкой оплаты
+                if order_id:
+                    try:
+                        msg_id = PENDING_MESSAGES.get(order_id)
+                        if msg_id:
+                            await bot.delete_message(chat_id=int(user_id), message_id=msg_id)
+                            del PENDING_MESSAGES[order_id]
+                    except:
+                        pass
+
+            except Exception as e:
+                print("Ошибка отправки пользователю:", e)
+
+        return {"success": True}
+
     return {"success": True}
+
 
 
 async def add_product_to_db(

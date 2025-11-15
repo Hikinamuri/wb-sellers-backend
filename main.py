@@ -23,6 +23,7 @@ BACKEND_URL = "https://api.hikinamuri.ru"
 SUPPORT_USERNAME = "@ekzoskidki7"
 # CHANNEL_ID = '@wbsellers_test'
 CHANNEL_ID = '@ekzoskidki'
+PENDING_MESSAGES = {}
 
 # 🔐 Список Telegram ID администраторов
 ADMIN_IDS = {933791537, 455197004, 810503099, 535437088}  # замени на свои tg_id
@@ -318,11 +319,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             import json as _json
 
-            # -----------------------------------------------------
-            #  Отправка инвойса Telegram API с чеком ЮKassa
-            # -----------------------------------------------------
-
-            await update.message.reply_invoice(
+            sent = await update.message.reply_invoice(
                 title=data["title"],
                 description=data["description"],
                 payload=data["payload"],
@@ -338,6 +335,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 
                 provider_data=_json.dumps(provider_data, ensure_ascii=False)
             )
+            PENDING_MESSAGES[data["payload"]] = sent.message_id
             return
 
         action = data.get('action')
@@ -637,6 +635,36 @@ async def stats_today_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(msg, parse_mode="HTML", reply_markup=kb)
 
 
+async def debug_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat = await context.bot.get_chat(CHANNEL_ID)
+
+        admins = await context.bot.get_chat_administrators(CHANNEL_ID)
+        admin_usernames = [a.user.username for a in admins]
+
+        can_post = False
+        for a in admins:
+            if a.user.id == context.bot.id:
+                can_post = a.can_post_messages if hasattr(a, "can_post_messages") else True
+
+        msg = [
+            "🔍 <b>Проверка канала</b>",
+            f"📢 Канал: {chat.title}",
+            f"🆔 ID: <code>{chat.id}</code>",
+            "",
+            "👮 <b>Администраторы:</b>",
+            "\n".join(f"• @{u}" for u in admin_usernames),
+            "",
+            f"🤖 Бот: @{context.bot.username}",
+            f"🟢 Является админом: {'<b>ДА</b>' if context.bot.username in admin_usernames else '<b>НЕТ</b>'}",
+            f"✍️ Может отправлять сообщения: {'<b>ДА</b>' if can_post else '<b>НЕТ</b>'}",
+        ]
+
+        await update.message.reply_text("\n".join(msg), parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
+        
 
 if __name__ == "__main__":
     print("🚀 Запускаю бота для Wildberries...")
@@ -655,6 +683,8 @@ if __name__ == "__main__":
         app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
         app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
         app.add_handler(CommandHandler("stats", admin_stats))
+        app.add_handler(CommandHandler("stats", admin_stats))
+        app.add_handler(CommandHandler("debug_channel", debug_channel))
         app.add_handler(CallbackQueryHandler(stats_months_callback, pattern="^stats_months$"))
         app.add_handler(CallbackQueryHandler(stats_today_callback, pattern="^stats_today$"))
         app.add_handler(CallbackQueryHandler(month_callback, pattern=r"^month:\d{4}:\d{1,2}$"))
