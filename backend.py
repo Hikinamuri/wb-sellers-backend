@@ -138,21 +138,21 @@ async def create_payment(request: Request):
     # 🧠 Возвращаем данные для Telegram Bot API
     payment_id = yookassa_payment.get("id")
     
-     return {
-        "success": True,
-        "payload": f"order_{order_id}",
-        "title": title,
-        "description": description,
-        "currency": "RUB",
-        "prices": prices,
-        "provider_token": os.getenv("TELEGRAM_PROVIDER_TOKEN"),
-        "metadata": safe_meta,
+        return {
+            "success": True,
+            "payload": f"order_{order_id}",
+            "title": title,
+            "description": description,
+            "currency": "RUB",
+            "prices": prices,
+            "provider_token": os.getenv("TELEGRAM_PROVIDER_TOKEN"),
+            "metadata": safe_meta,
 
-        "provider_data": {
-            "yookassa_payment_id": payment_id
-        },
+            "provider_data": {
+                "yookassa_payment_id": payment_id
+            },
 
-        "yookassa_payment_id": payment_id,
+            "yookassa_payment_id": payment_id,
     }
 
 async def publish_product(product_id: int, max_retries: int = 3):
