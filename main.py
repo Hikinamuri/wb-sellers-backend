@@ -38,6 +38,7 @@ parsing_cache = {}
 # --- Конфиг для YooKassa (из env) ---
 YOOKASSA_ACCOUNT = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_SECRET = os.getenv("YOOKASSA_SECRET_KEY")
+YK_PENDING = {}
 
 # Порог возраста YK-платежа (в секундах), старше которого мы пытаемся отменить чтобы избежать duplicate.
 YK_AGE_CANCEL_THRESHOLD = int(os.getenv("YK_AGE_CANCEL_THRESHOLD", "60"))  # дефолт 60s
@@ -338,7 +339,11 @@ async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_secon
             print(f"🗑 Auto-cancel attempt for {payment_id} -> {code} {text}")
             # уведомим пользователя (если надо)
             try:
-                await context.bot.send_message(chat_id=chat_id, text=("⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова." if not reason_msg else reason_msg), parse_mode="HTML")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова."),
+                    parse_mode="HTML"
+                )
             except Exception as e:
                 print("Ошибка отправки сообщения после автo-отмены:", e)
     except Exception as e:
@@ -503,6 +508,19 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
                 send_email_to_provider=True,
                 provider_data=json.dumps(provider_data, ensure_ascii=False),
             )
+            
+            # --- регистрация YK id, если backend прислал его
+            yk_id_from_backend = data.get("yookassa_payment_id")
+            if yk_id_from_backend:
+                YK_PENDING[yk_id_from_backend] = {
+                    "chat_id": update.effective_chat.id,
+                    "invoice_message_id": sent.message_id,
+                    "created_at": time.time(),
+                }
+                # на всякий случай — запустим кратковременную отложенную проверку (не обязателно)
+                asyncio.create_task(maybe_cancel_yk_after_delay(yk_id_from_backend, update.effective_chat.id, delay_seconds=8))
+                print(f"🧾 Registered pending yk id from backend: {yk_id_from_backend}")
+
 
 
             # ==========================
@@ -549,6 +567,10 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     pending_meta = pending_orders.get(payload, {}) or {}
 
     yk_id = pending_meta.get("yookassa_payment_id")
+    
+    if yk_id and yk_id in YK_PENDING:
+        print(f"💰 Payment succeeded, removing {yk_id} from YK_PENDING")
+        YK_PENDING.pop(yk_id, None)
 
     if not yk_id:
         print("⚠️ yookassa_payment_id не найден в context.user_data, пробуем provider_payment_charge_id как fallback")
@@ -632,17 +654,28 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("❌ Ошибка при добавлении товара в базу.")
 
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    
     query = update.pre_checkout_query
 
-    yk_id = query.provider_payment_charge_id  # <-- ЭТО id юкассы, нужный нам
+    yk_id = query.provider_payment_charge_id  # id юкассы присланный Telegram в precheckout
     payload = query.invoice_payload
     chat_id = query.from_user.id
 
     print("💳 pre_checkout:", yk_id, payload)
 
-    # запускаем авто-отмену через 8 секунд, если платёж зависнет
+    # попытка найти message_id для данного payload (если уже отправляли invoice)
+    invoice_info = SENT_INVOICES.get(payload)
+    invoice_msg_id = invoice_info["message_id"] if invoice_info else None
+
     if yk_id:
+        # регистрируем в глобальной очереди
+        YK_PENDING[yk_id] = {
+            "chat_id": chat_id,
+            "invoice_message_id": invoice_msg_id,
+            "created_at": time.time(),
+        }
+        print(f"🧾 Registered pending yk id from precheckout: {yk_id} -> msg={invoice_msg_id}")
+
+        # (опционально) создаём кратковременную задачу-страховку
         asyncio.create_task(
             maybe_cancel_yk_after_delay(
                 payment_id=yk_id,
@@ -654,6 +687,50 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer(ok=True)
 
+    
+async def auto_cancel_yookassa_loop():
+    """Фоновая задача: проверяет платежи и отменяет старые через ~8 сек."""
+    while True:
+        now = time.time()
+        expired = []
+
+        for pid, info in YK_PENDING.items():
+            age = now - info["created_at"]
+
+            if age >= 8:   # скорость вручную регулируется здесь
+                print(f"⏳ Auto-cancel: payment {pid} age={age:.1f}s")
+
+                # --- отмена в ЮKassa
+                code, text = await cancel_yk_payment(pid)
+                print(f"🗑 YK cancel {pid} → {code} {text}")
+
+                # --- уведомляем пользователя
+                try:
+                    await bot.send_message(
+                        chat_id=info["chat_id"],
+                        text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
+                        parse_mode="HTML"
+                    )
+                except: pass
+
+                # --- удаляем invoice
+                try:
+                    await bot.delete_message(
+                        chat_id=info["chat_id"],
+                        message_id=info["invoice_message_id"]
+                    )
+                except: pass
+
+                expired.append(pid)
+
+        for pid in expired:
+            YK_PENDING.pop(pid, None)
+
+        await asyncio.sleep(2)
+
+async def on_startup(app):
+    asyncio.create_task(auto_cancel_yookassa_loop())
+    print("🚀 Auto-cancel loop started")
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
@@ -918,14 +995,14 @@ if __name__ == "__main__":
     print(f"📞 Поддержка: {SUPPORT_USERNAME}")
     
     try:
-        app = Application.builder().token(BOT_TOKEN).post_init(remove_webhook_before_start).build()
+        app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
         
         # Обработчики
         app.add_handler(CommandHandler("start", start))
         app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
         app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+        app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
         app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
         app.add_handler(CommandHandler("stats", admin_stats))
         app.add_handler(CommandHandler("stats", admin_stats))

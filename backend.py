@@ -451,6 +451,11 @@ async def yookassa_callback(request: Request):
 
     # ==== Обработка отмены платежа ====
     if event == "payment.canceled":
+        pid = obj.get("id")
+        if pid and pid in YK_PENDING:
+            YK_PENDING.pop(pid, None)
+            print(f"🚫 YooKassa callback removed pending payment {pid}")
+        
         metadata = obj.get("metadata", {})
         user_id = metadata.get("user_id")
         order_id = metadata.get("order_id")
