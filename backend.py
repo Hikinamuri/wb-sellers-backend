@@ -91,6 +91,9 @@ async def create_payment(request: Request):
     # ⚙️ Создаём платёж в YooKassa (тест или боевой режим)
     yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
     yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
+    
+    expires_at_dt = (datetime.utcnow() + timedelta(seconds=10)).replace(microsecond=0)
+    expires_at_iso = expires_at_dt.isoformat() + "Z"
 
     yookassa_payment = {}
     
@@ -112,6 +115,7 @@ async def create_payment(request: Request):
                     "test": False,
                     "description": description,
                     "metadata": safe_meta,
+                    "expires_at": expires_at_iso,        
                     "receipt": {  # 👇 Обязательно при включённой фискализации
                         "customer": {
                             "email": "danya.pochta76@gmail.com",  # или phone
@@ -479,7 +483,7 @@ async def yookassa_callback(request: Request):
             except Exception as e:
                 print("Ошибка отправки пользователю:", e)
 
-        return {"success": True}
+        return {"success": True}    
 
     return {"success": True}
 

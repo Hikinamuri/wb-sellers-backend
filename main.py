@@ -239,18 +239,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
 
-    # Проверяем, зарегистрирован ли пользователь
-    async def is_user_registered(tg_id: int) -> bool:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{BACKEND_URL}/api/users/{tg_id}") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get("exists", False)
-        except Exception as e:
-            print(f"⚠️ Ошибка проверки пользователя: {e}")
-        return False
-
     if text == "📱 Открыть приложение":
         print(f"🔗 Пользователь {user_id} пытается открыть Web App")
 
@@ -285,7 +273,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "Используйте кнопки для управления 👇",
-            reply_markup=await get_main_keyboard()
+            reply_markup = await get_main_keyboard(user_id)
         )
 
 async def is_user_registered(tg_id: int) -> bool:
@@ -336,6 +324,26 @@ async def cancel_all_pending_invoices(context, chat_id):
     for payload in to_remove:
         SENT_INVOICES.pop(payload, None)
   
+async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_seconds: int = 10, reason_msg: str = None):
+    await asyncio.sleep(delay_seconds)
+    try:
+        yk = await fetch_yk_payment(payment_id)
+        if not yk:
+            print(f"ℹ️ cannot fetch yk payment {payment_id} after delay")
+            return
+        status = yk.get("status")
+        print(f"ℹ️ Post-delay YooKassa status for {payment_id}: {status}")
+        if status in ("pending", "waiting_for_capture"):
+            code, text = await cancel_yk_payment(payment_id)
+            print(f"🗑 Auto-cancel attempt for {payment_id} -> {code} {text}")
+            # уведомим пользователя (если надо)
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=("⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова." if not reason_msg else reason_msg), parse_mode="HTML")
+            except Exception as e:
+                print("Ошибка отправки сообщения после автo-отмены:", e)
+    except Exception as e:
+        print("Ошибка maybe_cancel_yk_after_delay:", e)
+
 
 async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка данных из Web App — с подробным логированием invoice"""
@@ -537,7 +545,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = update.message.successful_payment
     payload = payment.invoice_payload
-    pending_orders = context.user_data.get("pending_orders", {}) or {}
+    pending_orders = context.user_data.setdefault("pending_orders", {})
     pending_meta = pending_orders.get(payload, {}) or {}
 
     yk_id = pending_meta.get("yookassa_payment_id")
@@ -622,6 +630,30 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         print(f"❌ Ошибка при добавлении товара после оплаты: {e}")
         await update.message.reply_text("❌ Ошибка при добавлении товара в базу.")
+
+async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    
+    query = update.pre_checkout_query
+
+    yk_id = query.provider_payment_charge_id  # <-- ЭТО id юкассы, нужный нам
+    payload = query.invoice_payload
+    chat_id = query.from_user.id
+
+    print("💳 pre_checkout:", yk_id, payload)
+
+    # запускаем авто-отмену через 8 секунд, если платёж зависнет
+    if yk_id:
+        asyncio.create_task(
+            maybe_cancel_yk_after_delay(
+                payment_id=yk_id,
+                chat_id=chat_id,
+                delay_seconds=8,
+                reason_msg="⛔️ Оплата не была подтверждена. Попробуйте ещё раз."
+            )
+        )
+
+    await query.answer(ok=True)
+
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
@@ -902,7 +934,7 @@ if __name__ == "__main__":
         app.add_handler(CallbackQueryHandler(stats_today_callback, pattern="^stats_today$"))
         app.add_handler(CallbackQueryHandler(month_callback, pattern=r"^month:\d{4}:\d{1,2}$"))
         app.add_handler(CallbackQueryHandler(week_callback, pattern=r"^week:\d{4}:\d{1,2}:\d+$"))
-
+        app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
         
         print("✅ Бот запущен!")
         logging.basicConfig(level=logging.DEBUG)
