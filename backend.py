@@ -63,7 +63,11 @@ async def create_payment(request: Request):
     except Exception:
         data = {}
 
-    amount = float(data.get("amount", 1))
+    MIN_PAYMENT_RUB = 1.0
+    amount = float(data.get("amount", 1.0))
+    if amount < MIN_PAYMENT_RUB:
+        amount = MIN_PAYMENT_RUB
+
     meta = data.get("meta", {}) or {}
 
     order_id = str(uuid.uuid4())
@@ -72,7 +76,7 @@ async def create_payment(request: Request):
     description = f"Размещение товара: {meta.get('name', 'Товар')}"
 
     # Telegram требует сумму в КОПЕЙКАХ
-    prices = [{"label": "Публикация", "amount": int(amount * 1)}]
+    prices = [{"label": "Публикация", "amount": int(amount * 100)}]
 
     # 🔒 Санитизируем и сохраняем meta
     safe_meta = {
