@@ -27,6 +27,7 @@ CHANNEL_ID = "@ekzoskidki"
 TELEGRAM_PROVIDER_TOKEN=os.getenv("TELEGRAM_PROVIDER_TOKEN")
 PENDING_MESSAGES: dict[str, dict] = {}
 YK_PENDING: dict[str, dict] = {}
+PROCESSED_PAYMENTS: dict[str, dict] = {} 
 
 bot = Bot(token=BOT_TOKEN)
 
@@ -448,9 +449,12 @@ async def get_user_products(tg_id: str, session: AsyncSession = Depends(get_sess
 
 @app.post("/api/payments/callback")
 async def yookassa_callback(request: Request):
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
     event = payload.get("event")
-    obj = payload.get("object", {})
+    obj = payload.get("object", {})  
 
     print("💳 YooKassa callback:", event)
     print("💳 CALLBACK RAW:", json.dumps(payload, ensure_ascii=False))
@@ -460,13 +464,32 @@ async def yookassa_callback(request: Request):
     order_id = metadata.get("order_id")
     pid = obj.get("id")
 
-    bot = Bot(BOT_TOKEN)  # создаём один раз
+    # Safety: если нет pid — просто ответим ok
+    if not pid:
+        print("⚠️ Callback без id -> игнорируем")
+        return {"success": True}
+
+    # Если уже обработано — не делать лишних действий (идемпотентность)
+    processed = PROCESSED_PAYMENTS.get(pid)
+    if processed:
+        # если уже помечено как succeeded и мы получили canceled — игнорируем cancel
+        if event == "payment.canceled" and processed.get("status") == "succeeded":
+            print(f"ℹ️ Ignoring payment.canceled for {pid} because we've already processed succeeded")
+            return {"success": True}
+        # если уже помечено как canceled и пришёл succeeded — всё ещё обрабатывать succeeded (в редких race-условиях),
+        # но если уже succeeded — просто вернуть OK.
+        if event in ("payment.succeeded", "payment.captured", "payment.paid") and processed.get("status") == "succeeded":
+            print(f"ℹ️ Duplicate succeeded callback for {pid} — игнорируем")
+            return {"success": True}
+
+    bot = Bot(BOT_TOKEN)
 
     # ==== Обработка отмены платежа ====
     if event == "payment.canceled":
-        if pid:
-            YK_PENDING.pop(pid, None)
-            print(f"🚫 YooKassa callback removed pending payment {pid}")
+        # если мы уже обрабатывали succeeded — выше вернули True
+        YK_PENDING.pop(pid, None)
+        PROCESSED_PAYMENTS[pid] = {"status": "canceled", "ts": time.time()}
+        print(f"🚫 YooKassa callback marked payment canceled {pid}")
 
         if user_id:
             try:
@@ -476,25 +499,35 @@ async def yookassa_callback(request: Request):
                     parse_mode="HTML"
                 )
             except Exception as e:
-                print("⚠️ Ошибка отправки пользователю:", e)
+                print("Ошибка отправки пользователю (canceled):", e)
 
-        # удаляем сообщение с кнопкой оплаты, если есть
+        # удаляем кнопку оплаты если есть
         if order_id and order_id in PENDING_MESSAGES:
             info = PENDING_MESSAGES.pop(order_id, None)
             if info:
                 try:
                     await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
-                except Exception as e:
-                    print("⚠️ Ошибка удаления pending message:", e)
+                except Exception:
+                    pass
 
         return {"success": True}
 
     # ==== Обработка успешной оплаты ====
     if event in ("payment.succeeded", "payment.captured", "payment.paid"):
         print(f"✅ Payment succeeded for id={pid}")
+        # пометим как успешно обработанный
+        PROCESSED_PAYMENTS[pid] = {"status": "succeeded", "ts": time.time()}
 
-        if pid:
-            YK_PENDING.pop(pid, None)
+        # отменяем отложенные задачи-отмены, если они есть
+        pending = YK_PENDING.pop(pid, None)
+        if pending:
+            # отменим фоновую задачу, если она сохранена
+            task = pending.get("cancel_task")
+            if task and not task.done():
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
 
         # уведомляем пользователя
         if user_id:
@@ -507,7 +540,7 @@ async def yookassa_callback(request: Request):
             except Exception as e:
                 print("⚠️ Не получилось уведомить пользователя:", e)
 
-        # удаляем кнопку оплаты из чата (если есть)
+        # удаляем кнопку оплаты (если есть)
         if order_id and order_id in PENDING_MESSAGES:
             info = PENDING_MESSAGES.pop(order_id, None)
             if info:
@@ -519,7 +552,6 @@ async def yookassa_callback(request: Request):
         # добавляем товар в базу асинхронно
         if metadata:
             try:
-                import asyncio
                 asyncio.create_task(
                     add_product_to_db(
                         user_id=str(user_id),
@@ -537,9 +569,8 @@ async def yookassa_callback(request: Request):
 
         return {"success": True}
 
-    # по умолчанию отвечаем успехом — чтобы YooKassa не повторяла
+    # default
     return {"success": True}
-
 
 async def add_product_to_db(
     user_id: str,

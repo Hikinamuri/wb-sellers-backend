@@ -338,31 +338,71 @@ async def cancel_all_pending_invoices(context, chat_id):
 async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_seconds: int = 25, reason_msg: str = None):
     await asyncio.sleep(delay_seconds)
     try:
-        yk = await fetch_yk_payment(payment_id)
-        status = yk.get("status") if yk else None
+        # если уже обработан как succeeded — не трогаем
+        pinfo = PROCESSED_PAYMENTS.get(payment_id)
+        if pinfo and pinfo.get("status") == "succeeded":
+            print(f"✅ Delayed check: платеж {payment_id} уже успешен, не отменяем")
+            # очистим YK_PENDING если осталось
+            YK_PENDING.pop(payment_id, None)
+            return
 
+        yk = await fetch_yk_payment(payment_id)
+        if not yk:
+            print(f"ℹ️ cannot fetch yk payment {payment_id} after delay")
+            return
+
+        status = yk.get("status")
+        print(f"ℹ️ Post-delay YooKassa status for {payment_id}: {status}")
+
+        # если платеж уже успешен — помечаем и выходим
+        if status in ("succeeded", "captured"):
+            PROCESSED_PAYMENTS[payment_id] = {"status": "succeeded", "ts": time.time()}
+            # удаляем pending запись и отменяем созданную задачу (если есть)
+            pending = YK_PENDING.pop(payment_id, None)
+            if pending and pending.get("cancel_task"):
+                try:
+                    pending["cancel_task"].cancel()
+                except Exception:
+                    pass
+            print(f"✅ Delayed check: платеж {payment_id} завершён — не отменяем")
+            return
+
+        # отменяем только если он всё ещё в состоянии ожидается
         if status in ("pending", "waiting_for_capture"):
             code, text = await cancel_yk_payment(payment_id)
-            print(f"🗑 Delayed cancel {payment_id} -> {code} {text}")
+            print(f"🗑 Auto-cancel attempt for {payment_id} -> {code} {text}")
 
-            if BOT:
-                await BOT.send_message(
-                    chat_id=chat_id,
-                    text=reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова.",
-                    parse_mode="HTML"
-                )
+            # уведомим пользователя и почистим локальные структуры, только если запись была в YK_PENDING
+            pending = YK_PENDING.pop(payment_id, None)
+            if pending:
+                try:
+                    global BOT
+                    if BOT:
+                        await BOT.send_message(
+                            chat_id=pending.get("chat_id"),
+                            text=(reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова."),
+                            parse_mode="HTML"
+                        )
+                except Exception as e:
+                    print("Ошибка отправки сообщения после автo-отмены:", e)
 
-        elif status in ("succeeded", "captured"):
-            print(f"✅ Delayed check: платеж {payment_id} уже успешен, не отменяем")
-            YK_PENDING.pop(payment_id, None)
+                # удалим отправленное ранее сообщение-кнопку (если известно)
+                try:
+                    if pending.get("invoice_message_id") and BOT:
+                        await BOT.delete_message(chat_id=pending["chat_id"], message_id=pending["invoice_message_id"])
+                except Exception as e:
+                    print("⚠️ Ошибка при удалении invoice message после автo-отмены:", e)
+
+            # пометим как canceled
+            PROCESSED_PAYMENTS[payment_id] = {"status": "canceled", "ts": time.time()}
 
         else:
-            print(f"⚠️ Delayed check: неожиданный статус {status} для {payment_id}")
-
+            print(f"ℹ️ Delayed check: статус {status} — никаких действий")
+    except asyncio.CancelledError:
+        # задача могла быть отменена законно — игнорируем
+        return
     except Exception as e:
         print("Ошибка maybe_cancel_yk_after_delay:", e)
-
-
 
 async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка данных из Web App — с подробным логированием invoice"""
@@ -675,52 +715,65 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     
 async def auto_cancel_yookassa_loop():
-    """Фоновая задача: проверяет платежи и отменяет старые через ~20 сек."""
     global BOT
     while True:
         now = time.time()
         expired = []
 
+        # копируем ключи, чтобы не итерировать и не модифицировать одновременно
         for pid, info in list(YK_PENDING.items()):
-            age = now - info.get("created_at", now)
-            if age >= 120:  # интервал для автo-отмены
-                print(f"⏳ Auto-cancel: payment {pid} age={age:.1f}s")
+            try:
+                age = now - info.get("created_at", now)
+                # жёстко увеличим порог до 120s или возьми env
+                if age < int(os.getenv("YK_AUTO_CANCEL_THRESHOLD", "120")):
+                    continue
 
-                try:
-                    yk_info = await fetch_yk_payment(pid)
-                    status = yk_info.get("status") if yk_info else None
+                # перепроверим реальный статус у YooKassa
+                yk_info = await fetch_yk_payment(pid)
+                if not yk_info:
+                    print(f"ℹ️ auto_cancel: не удалось fetch yk {pid}, пропускаем")
+                    continue
+                status = yk_info.get("status")
+                print(f"ℹ️ auto_cancel: status for {pid} = {status} (age={age:.1f}s)")
 
-                    if status in ("pending", "waiting_for_capture"):
-                        code, text = await cancel_yk_payment(pid)
-                        print(f"🗑 YK cancel {pid} → {code} {text}")
+                # отменяем только если реально в pending
+                if status in ("pending", "waiting_for_capture"):
+                    code, text = await cancel_yk_payment(pid)
+                    print(f"🗑 YK cancel {pid} → {code} {text}")
 
-                        # уведомляем пользователя
+                    # уведомим пользователя
+                    try:
                         if BOT:
                             await BOT.send_message(
                                 chat_id=info["chat_id"],
                                 text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
                                 parse_mode="HTML"
                             )
+                    except Exception as e:
+                        print("⚠️ Ошибка при отправке уведомления после автo-отмены:", e)
 
-                        # удаляем invoice сообщение
+                    # попытка удалить сообщение-кнопку
+                    try:
                         if info.get("invoice_message_id") and BOT:
                             await BOT.delete_message(chat_id=info["chat_id"], message_id=info["invoice_message_id"])
+                    except Exception as e:
+                        print("⚠️ Ошибка при удалении invoice message после автo-отмены:", e)
 
-                    elif status in ("succeeded", "captured"):
-                        print(f"✅ Оплата {pid} уже успешна, не отменяем")
-                        expired.append(pid)  # удаляем из YK_PENDING
+                    PROCESSED_PAYMENTS[pid] = {"status": "canceled", "ts": time.time()}
+                    expired.append(pid)
+                else:
+                    # если уже succeeded/captured — просто убираем pending и не шлём cancel уведомление
+                    if status in ("succeeded", "captured"):
+                        print(f"✅ auto_cancel: {pid} уже {status} — убираем из очереди")
+                        expired.append(pid)
 
-                    else:
-                        print(f"⚠️ Статус {pid} неожиданный: {status}")
-
-                except Exception as e:
-                    print(f"⚠️ Ошибка при проверке/отмене платежа {pid}: {e}")
+            except Exception as e:
+                print("⚠️ Ошибка в auto_cancel loop при обработке", pid, e)
 
         for pid in expired:
             YK_PENDING.pop(pid, None)
 
-        await asyncio.sleep(1)
-
+        await asyncio.sleep(5)
 async def on_startup(application):
     global BOT
     # application — это Application из python-telegram-bot; у него есть .bot
