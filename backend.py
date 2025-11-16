@@ -25,6 +25,8 @@ import asyncio
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(BOT_TOKEN)
+
 CHANNEL_ID = "@ekzoskidki" 
 TELEGRAM_PROVIDER_TOKEN=os.getenv("TELEGRAM_PROVIDER_TOKEN")
 PENDING_MESSAGES: dict[str, dict] = {}
@@ -470,6 +472,10 @@ async def yookassa_callback(request: Request):
     if not pid:
         print("⚠️ Callback без id -> игнорируем")
         return {"success": True}
+    
+    if pid in PROCESSED_PAYMENTS and PROCESSED_PAYMENTS[pid]["status"] == "succeeded":
+        print(f"⚠️ Payment {pid} already succeeded, ignoring cancellation")
+        return {"success": True}
 
     # Если уже обработано — не делать лишних действий (идемпотентность)
     processed = PROCESSED_PAYMENTS.get(pid)
@@ -484,10 +490,12 @@ async def yookassa_callback(request: Request):
             print(f"ℹ️ Duplicate succeeded callback for {pid} — игнорируем")
             return {"success": True}
 
-    bot = Bot(BOT_TOKEN)
 
     # ==== Обработка отмены платежа ====
     if event == "payment.canceled":
+        if pid in PROCESSED_PAYMENTS and PROCESSED_PAYMENTS[pid]["status"] == "succeeded":
+            print(f"⚠️ Payment {pid} already succeeded, ignoring cancellation")
+            return {"success": True}
         # если мы уже обрабатывали succeeded — выше вернули True
         YK_PENDING.pop(pid, None)
         PROCESSED_PAYMENTS[pid] = {"status": "canceled", "ts": time.time()}
