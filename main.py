@@ -77,22 +77,15 @@ async def cancel_yk_payment(payment_id: str) -> tuple[int, str]:
         return (0, str(e))
 
 # ---------- Конец вспомогательных функций ----------
-async def send_payment_button(user_id: int, confirmation_url: str, order_id: str):
-    from telegram import Bot
-    bot = Bot(BOT_TOKEN)
-
-    sent = await bot.send_message(
-        chat_id=user_id,
-        text="💳 Для оплаты нажмите кнопку ниже. Оплата откроется в браузере.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Оплатить", url=confirmation_url)]]
-        ),
+async def send_payment_button(bot, user_id: int, confirmation_url: str, order_id: str):
+    text = (
+        "💳 Чтобы оплатить заказ, нажмите кнопку ниже — оплата откроется в браузере.\n\n"
+        "После оплаты мы получим уведомление и автоматически добавим товар в очередь."
     )
-
-    # Сохраняем соответствие order_id → сообщение, чтобы удалить при отмене/успехе
-    PENDING_MESSAGES[order_id] = {"chat_id": user_id, "message_id": sent.message_id}
-
-    print(f"🟢 Отправлена кнопка оплаты для order_id={order_id}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Оплатить", url=confirmation_url)]])
+    sent = await bot.send_message(chat_id=int(user_id), text=text, reply_markup=kb)
+    # Сохранять запись в PENDING_MESSAGES делает вызывающий код
+    return sent
     
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -406,177 +399,150 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             await cancel_all_pending_invoices(context, update.effective_chat.id)
             context.user_data["pending_orders"] = {}
 
-            # --- базовый payload от фронта ---
             raw_key = data.get("payload") or "order"
-
-            # --- создаём полностью уникальный payload ---
             payload = generate_unique_payload(raw_key)
             data["payload"] = payload
-            
+
             print(f"🔐 Generated payload via function: {payload}")
 
-            # =================================================
-            #   УДАЛЯЕМ старый invoice, если он был ранее
-            # =================================================
+            # удаляем старый message, если был
             old = PENDING_MESSAGES.get(raw_key)
             if old:
                 try:
-                    await context.bot.delete_message(
-                        chat_id=old["chat_id"],
-                        message_id=old["message_id"]
-                    )
+                    await context.bot.delete_message(chat_id=old["chat_id"], message_id=old["message_id"])
                     print(f"🗑 Deleted old invoice message {old['message_id']} for key {raw_key}")
                 except Exception as e:
                     print(f"⚠️ Could not delete old invoice {old}: {e}")
-
                 PENDING_MESSAGES.pop(raw_key, None)
 
-            # ==========================
-            #  Проверяем переданный yookassa_payment_id (если есть)
-            #  и пытаемся отменить старый pending-платеж, чтобы избежать duplicate
-            # ==========================
+            # проверяем incoming yookassa id (как раньше)
             incoming_yk = data.get("yookassa_payment_id")
             accepted_yk = None
-
+            yk_info = None
             if incoming_yk:
                 print("ℹ️ WebApp provided yookassa_payment_id:", incoming_yk)
                 yk_info = await fetch_yk_payment(incoming_yk)
                 if not yk_info:
-                    print("⚠️ Не удалось получить данные по YooKassa платежу или креды отсутствуют — игнорируем incoming id")
+                    print("⚠️ Не удалось получить данные по YooKassa платежу — игнорируем incoming id")
                 else:
                     yk_status = yk_info.get("status")
                     created_at = yk_info.get("created_at")
                     print(f"ℹ️ YooKassa status={yk_status}, created_at={created_at} for id={incoming_yk}")
 
-                    # Попробуем вычислить возраст платежа (в сек)
                     age_seconds = None
                     if created_at:
                         try:
-                            # fromisoformat может парсить +00:00, если есть Z — заменим
                             created_norm = created_at.replace("Z", "+00:00")
                             created_dt = datetime.fromisoformat(created_norm)
                             now_utc = datetime.now(timezone.utc)
-                            # если created_dt не имеет tzinfo, считаем как UTC
                             if created_dt.tzinfo is None:
                                 created_dt = created_dt.replace(tzinfo=timezone.utc)
                             age_seconds = (now_utc - created_dt).total_seconds()
                         except Exception as e:
                             print("⚠️ Не удалось распарсить created_at:", e)
 
-                    # Логика: если статус pending/waiting_for_capture и возраст > threshold -> отменяем
                     if yk_status in ("pending", "waiting_for_capture"):
                         if age_seconds is None:
-                            print("⚠️ Не удалось получить возраст платежа — по безопасности игнорируем incoming id")
+                            print("⚠️ Не удалось получить возраст платежа — игнорируем incoming id")
                         else:
                             print(f"ℹ️ YooKassa payment age={age_seconds:.1f}s (threshold={YK_AGE_CANCEL_THRESHOLD}s)")
                             if age_seconds > YK_AGE_CANCEL_THRESHOLD:
                                 code, text = await cancel_yk_payment(incoming_yk)
                                 print(f"🗑 Cancel attempt for {incoming_yk} -> {code} {text}")
-                                # не сохраняем incoming id (он отменён)
                             else:
-                                # Если платёж совсем свежий (< threshold), чтобы избежать race — лучше не переиспользовать старый id,
-                                # т.к. submit duplicate может появиться при повторном использовании. Решение: **не сохраняем** incoming id
                                 print("⚠️ YooKassa payment is fresh but to avoid duplicates we will ignore incoming id and let Telegram create a new one.")
                     elif yk_status in ("succeeded", "succeeded_by_provider", "captured"):
-                        # Теоретически можно принять, но чаще всего это не случится в момент создания invoice — логируем и принимаем
                         accepted_yk = incoming_yk
                         print("✅ YooKassa payment already succeeded — accepting incoming id.")
                     else:
                         print("⚠️ YooKassa payment in unexpected status -> ignoring:", yk_status)
 
-            # ==========================
-            #  ФОРМИРУЕМ ЧЕК ЮКАССЫ (local provider_data для Telegram)
-            # ==========================
+            # receipt/provider_data формируем как раньше
             prices = [LabeledPrice(**p) for p in data["prices"]]
-
             amount_cop = data["prices"][0]["amount"]
             amount_rub = amount_cop / 100
-
-            base_desc = data.get("description", "")[:110]  # оставляем запас для хвоста
-            unique_suffix = uuid.uuid4().hex[:6]          # уникальный короткий ID
-            receipt_description = f"{base_desc} | {unique_suffix}"  # ← уникальна для каждого вызова
-
+            base_desc = data.get("description", "")[:110]
+            unique_suffix = uuid.uuid4().hex[:6]
+            receipt_description = f"{base_desc} | {unique_suffix}"
             provider_data = {
                 "receipt": {
-                    "items": [
-                        {
-                            "description": receipt_description,
-                            "quantity": "1.00",
-                            "amount": {
-                                "value": f"{amount_rub:.2f}",
-                                "currency": "RUB"
-                            },
-                            "vat_code": 1,
-                            "payment_mode": "full_payment",
-                            "payment_subject": "service",
-                        }
-                    ],
+                    "items": [{
+                        "description": receipt_description,
+                        "quantity": "1.00",
+                        "amount": {"value": f"{amount_rub:.2f}", "currency": "RUB"},
+                        "vat_code": 1,
+                        "payment_mode": "full_payment",
+                        "payment_subject": "service",
+                    }],
                     "tax_system_code": 1
                 }
             }
 
-            # ==========================
-            #  СОХРАНЯЕМ МЕТАДАННЫЕ ПЛАТЕЖА (но НЕ вслепую incoming yk id)
-            # ==========================
+            # pending_meta (metadata от фронта)
             pending_meta = data.get("metadata", {}) or {}
             if accepted_yk:
                 pending_meta["yookassa_payment_id"] = accepted_yk
             else:
-                # чтобы избежать дубликатов, явно не сохраняем incoming yk id
                 if data.get("yookassa_payment_id"):
                     print("ℹ️ Ignoring incoming yookassa_payment_id to avoid duplicate submits.")
 
-            # сохраняем meta по УНИКАЛЬНОМУ payload
-            context.user_data.setdefault("pending_orders", {})[payload] = {
-                **pending_meta,
-                "raw_key": raw_key
-            }
+            # сохраняем meta по payload
+            context.user_data.setdefault("pending_orders", {})[payload] = { **pending_meta, "raw_key": raw_key }
 
-            # ==========================
-            #  ОТПРАВЛЯЕМ INVOICE
-            # ==========================
-            sent = await send_payment_button(user_id=int(tg_id), confirmation_url=confirmation_url, order_id=order_id)
+            # --- получаем или вычисляем confirmation_url ---
+            confirmation_url = data.get("confirmation_url")
+            if not confirmation_url and yk_info:
+                confirmation_url = (yk_info.get("confirmation") or {}).get("confirmation_url")
 
-            
-            # --- регистрация YK id, если backend прислал его
-            yk_id_from_backend = data.get("yookassa_payment_id")
-            if yk_id_from_backend:
-                YK_PENDING[yk_id_from_backend] = {
-                    "chat_id": update.effective_chat.id,
-                    "invoice_message_id": sent.message_id,
-                    "created_at": time.time(),
+            # если confirmation_url отсутствует — пробуем подгрузить информацию по incoming_yk (ещё одна попытка)
+            if not confirmation_url and incoming_yk and not yk_info:
+                yk_info2 = await fetch_yk_payment(incoming_yk)
+                confirmation_url = (yk_info2.get("confirmation") or {}).get("confirmation_url") if yk_info2 else None
+
+            # --- Получаем tg_id (устанавливаем безопасный fallback) ---
+            metadata = pending_meta or data.get("metadata", {}) or {}
+            tg_id = metadata.get("user_id") or metadata.get("tg_id") or update.effective_user.id
+
+            # --- ORDER ID для сопоставления ---
+            order_id = metadata.get("order_id") or raw_key
+
+            # --- Отправляем кнопку с внешней ссылкой (если есть confirmation_url) ---
+            if confirmation_url:
+                # send_payment_button должен вернуть Message объект
+                sent_msg = await send_payment_button(bot=context.bot, user_id=int(tg_id), confirmation_url=confirmation_url, order_id=order_id)
+
+                # регистрируем YK pending (если есть)
+                yk_id_from_backend = data.get("yookassa_payment_id")
+                if yk_id_from_backend:
+                    YK_PENDING[yk_id_from_backend] = {
+                        "chat_id": int(tg_id),
+                        "invoice_message_id": sent_msg.message_id,
+                        "created_at": time.time(),
+                        "order_id": order_id,
+                    }
+                    asyncio.create_task(maybe_cancel_yk_after_delay(yk_id_from_backend, int(tg_id), delay_seconds=25))
+                    print(f"🧾 Registered pending yk id from backend: {yk_id_from_backend}")
+
+                # регистрируем PENDING_MESSAGES по order_id
+                info = {
+                    "chat_id": int(tg_id),
+                    "message_id": sent_msg.message_id,
+                    "ts": int(time.time()),
+                    "provider_data": provider_data,
+                    "raw_key": raw_key,
+                    "order_id": order_id,
                 }
-                # на всякий случай — запустим кратковременную отложенную проверку (не обязателно)
-                asyncio.create_task(maybe_cancel_yk_after_delay(yk_id_from_backend, update.effective_chat.id, delay_seconds=25))
-                print(f"🧾 Registered pending yk id from backend: {yk_id_from_backend}")
+                PENDING_MESSAGES[order_id] = info
+                SENT_INVOICES[payload] = info
 
+                print(f"✅ Sent payment button. payload={payload} chat={info['chat_id']} msg={info['message_id']}")
+                return
 
-
-            # ==========================
-            #  РЕГИСТРАЦИЯ ОТПРАВЛЕННОГО ИНВОЙСА
-            # ==========================
-            info = {
-                "chat_id": update.effective_chat.id,
-                "message_id": sent.message_id,
-                "ts": int(time.time()),
-                "provider_data": provider_data,
-                "raw_key": raw_key,
-            }
-
-            PENDING_MESSAGES[raw_key] = info
-            SENT_INVOICES[payload] = info
-            
-            # если в metadata пришёл order_id — сохраним и по нему, чтобы backend мог удалить сообщение по order_id
-            try:
-                order_id_from_meta = (pending_meta or {}).get("order_id") or data.get("metadata", {}).get("order_id")
-                if order_id_from_meta:
-                    PENDING_MESSAGES[order_id_from_meta] = info
-            except Exception:
-                pass
-
-            SENT_INVOICES[payload] = info
-
-            print(f"✅ Sent invoice. payload={payload} chat={info['chat_id']} msg={info['message_id']}")
+            # если нет confirmation_url — можно fallback на reply_invoice (опционально)
+            # тут можно оставить прежний reply_invoice или вернуть ошибку
+            print("⚠️ confirmation_url not found — falling back to reply_invoice (or abort).")
+            # (опционально) отправим ошибочный ответ
+            await update.message.reply_text("⚠️ Не удалось сформировать ссылку для оплаты. Попробуйте снова.")
             return
 
         # ==========================

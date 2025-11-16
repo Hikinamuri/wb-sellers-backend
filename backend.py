@@ -449,47 +449,91 @@ async def yookassa_callback(request: Request):
     print("💳 YooKassa callback:", event)
     print("💳 CALLBACK RAW:", json.dumps(payload, ensure_ascii=False))
 
+    metadata = obj.get("metadata", {}) or {}
+    user_id = metadata.get("user_id") or metadata.get("tg_id")
+    order_id = metadata.get("order_id")
+    pid = obj.get("id")
+
     # ==== Обработка отмены платежа ====
     if event == "payment.canceled":
-        pid = obj.get("id")
         if pid and pid in YK_PENDING:
             YK_PENDING.pop(pid, None)
             print(f"🚫 YooKassa callback removed pending payment {pid}")
-        
-        metadata = obj.get("metadata", {})
-        user_id = metadata.get("user_id")
-        order_id = metadata.get("order_id")
 
         if user_id:
-            # Отправляем в Telegram сообщение об отмене
             try:
-                from telegram import Bot
                 bot = Bot(BOT_TOKEN)
-
                 await bot.send_message(
                     chat_id=int(user_id),
-                    text=(
-                        "⛔ <b>Оплата отменена</b>\n"
-                        "Вы можете попробовать снова."
-                    ),
+                    text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
                     parse_mode="HTML"
                 )
 
-                # Удаляем сообщение с кнопкой оплаты
-                if order_id:
-                    try:
-                        msg_id = PENDING_MESSAGES.get(order_id)
-                        if msg_id:
-                            await bot.delete_message(chat_id=int(user_id), message_id=msg_id)
-                            del PENDING_MESSAGES[order_id]
-                    except:
-                        pass
+                # Удаляем сообщение с кнопкой оплаты, если есть
+                if order_id and order_id in PENDING_MESSAGES:
+                    info = PENDING_MESSAGES.pop(order_id, None)
+                    if info:
+                        try:
+                            await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
+                        except Exception:
+                            pass
 
             except Exception as e:
                 print("Ошибка отправки пользователю:", e)
 
-        return {"success": True}    
+        return {"success": True}
 
+    # ==== Обработка успешной оплаты ====
+    if event in ("payment.succeeded", "payment.captured", "payment.paid"):
+        print(f"✅ Payment succeeded for id={pid}")
+        # убираем из ожиданий
+        if pid and pid in YK_PENDING:
+            YK_PENDING.pop(pid, None)
+
+        # уведомляем пользователя
+        if user_id:
+            try:
+                bot = Bot(BOT_TOKEN)
+                await bot.send_message(
+                    chat_id=int(user_id),
+                    text="✅ <b>Оплата получена</b>\nДобавляю товар в очередь на выкладку...",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print("⚠️ Не получилось уведомить пользователя:", e)
+
+        # удаляем кнопку оплаты из чата (если есть)
+        if order_id and order_id in PENDING_MESSAGES:
+            info = PENDING_MESSAGES.pop(order_id, None)
+            if info:
+                try:
+                    bot = Bot(BOT_TOKEN)
+                    await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
+                except Exception as e:
+                    print("⚠️ Ошибка удаления pending message:", e)
+
+        # добавляем товар в базу (асинхронно, чтобы быстро ответить webhook)
+        if metadata:
+            try:
+                import asyncio
+                asyncio.create_task(
+                    add_product_to_db(
+                        user_id=str(metadata.get("user_id") or metadata.get("tg_id")),
+                        url=metadata.get("url"),
+                        name=metadata.get("name"),
+                        description=metadata.get("description") or "",
+                        image_url=metadata.get("image_url"),
+                        price=float(metadata.get("price") or 0),
+                        scheduled_date=metadata.get("scheduled_date"),
+                        category=metadata.get("category"),
+                    )
+                )
+            except Exception as e:
+                print("⚠️ Ошибка при планировании add_product_to_db:", e)
+
+        return {"success": True}
+
+    # по умолчанию отвечаем успехом — чтобы YooKassa не повторяла
     return {"success": True}
 
 
