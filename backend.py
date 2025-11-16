@@ -25,6 +25,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = "@ekzoskidki" 
 TELEGRAM_PROVIDER_TOKEN=os.getenv("TELEGRAM_PROVIDER_TOKEN")
+YK_PENDING = {}
 
 bot = Bot(token=BOT_TOKEN)
 
