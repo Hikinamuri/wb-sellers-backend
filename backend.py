@@ -56,44 +56,6 @@ async def startup_event():
     await test_connection()
 
 
-@app.post("/api/payments/sbp/create")
-async def create_sbp(request: Request):
-    data = await request.json()
-
-    amount = float(data.get("amount"))
-    meta = data.get("meta", {})
-
-    order_id = meta.get("order_id") or str(uuid.uuid4())
-
-    yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
-    yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
-
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://api.yookassa.ru/v3/payments",
-            auth=(yookassa_account, yookassa_secret),
-            headers={"Idempotence-Key": order_id},
-            json={
-                "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                "payment_method_data": {"type": "sbp"},
-                "confirmation": {
-                    "type": "redirect",
-                    "return_url": "https://t.me/WBerriesSeller_bot"
-                },
-                "capture": True,
-                "description": f"СБП платеж: заказ {order_id}",
-                "metadata": meta
-            }
-        )
-        yk = r.json()
-
-    return {
-        "success": True,
-        "sbp_url": yk["confirmation"]["confirmation_url"],
-        "payment_id": yk["id"]
-    }
-
-
 @app.post("/api/payments/create")
 async def create_payment(request: Request):
     try:
@@ -108,8 +70,11 @@ async def create_payment(request: Request):
 
     title = "Оплата размещения товара"
     description = f"Размещение товара: {meta.get('name', 'Товар')}"
+
+    # Telegram требует сумму в КОПЕЙКАХ
     prices = [{"label": "Публикация", "amount": int(amount * 100)}]
 
+    # 🔒 Санитизируем и сохраняем meta
     safe_meta = {
         "order_id": order_id,
         "user_id": _sanitize_meta_field(meta.get("user_id") or meta.get("tg_id") or "", 64),
@@ -121,93 +86,62 @@ async def create_payment(request: Request):
         "category": _sanitize_meta_field(meta.get("category", ""), 64),
     }
 
+    print("🧾 SAFE META:", safe_meta)
+
+    # ⚙️ Создаём платёж в YooKassa (тест или боевой режим)
     yookassa_secret = os.getenv("YOOKASSA_SECRET_KEY")
     yookassa_account = os.getenv("YOOKASSA_SHOP_ID")
-
-    # expires for yk payment (как у тебя)
+    
     expires_at_dt = (datetime.utcnow() + timedelta(seconds=10)).replace(microsecond=0)
     expires_at_iso = expires_at_dt.isoformat() + "Z"
 
     yookassa_payment = {}
-    sbp_payment = {}
-    sbp_confirm_url = None
-    sbp_qr = None
-
-    if yookassa_secret and yookassa_account:
+    
+    if not yookassa_secret or not yookassa_account:
+        print("⚠️ Не удалось получить ключи YooKassa")
+    else:
         async with httpx.AsyncClient() as client:
-            # ——— 1) Обычный платеж (карты и пр.) — как у тебя был
-            try:
-                resp = await client.post(
-                    "https://api.yookassa.ru/v3/payments",
-                    auth=(yookassa_account, yookassa_secret),
-                    headers={"Idempotence-Key": order_id},
-                    json={
-                        "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                        "confirmation": {
-                            "type": "redirect",
-                            # возврат в WebApp или страницу успеха
-                            "return_url": os.getenv("WEB_APP_URL", "https://your-webapp/")  # поменяй при необходимости
-                        },
-                        "capture": True,
-                        "description": description,
-                        "metadata": safe_meta,
-                        "expires_at": expires_at_iso,
-                        "receipt": {
-                            "customer": {"email": safe_meta.get("user_email") or "no-reply@example.com"},
-                            "items": [
-                                {
-                                    "description": safe_meta.get("name") or "Публикация товара",
-                                    "quantity": "1.00",
-                                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                                    "vat_code": 1,
-                                    "payment_subject": "service",
-                                    "payment_mode": "full_payment"
-                                }
-                            ]
-                        }
+            yookassa_payment = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                auth=(yookassa_account, yookassa_secret),
+                headers={"Idempotence-Key": order_id},
+                json={
+                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+                    "confirmation": {
+                        "type": "redirect",
+                        "return_url": "https://t.me/WBerriesSeller_bot"
                     },
-                    timeout=10.0,
-                )
-                yookassa_payment = resp.json()
-            except Exception as e:
-                print("⚠️ Ошибка создания обычной оплаты YooKassa:", e)
-                yookassa_payment = {}
-
-            # ——— 2) Создаём второй платёж специально под SBP (чтобы дать пользователю ссылку/QR)
-            try:
-                sbp_resp = await client.post(
-                    "https://api.yookassa.ru/v3/payments",
-                    auth=(yookassa_account, yookassa_secret),
-                    headers={"Idempotence-Key": f"{order_id}_sbp"},
-                    json={
-                        "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                        "payment_method_data": {"type": "sbp"},
-                        "confirmation": {
-                            "type": "redirect",
-                            # Возврат на страницу успеха в твоём WebApp или на бэкенд-роут
-                            "return_url": os.getenv("WEB_APP_URL", "https://your-webapp/") + f"?order_id={order_id}&method=sbp"
+                    "capture": True,
+                    "test": False,
+                    "description": description,
+                    "metadata": safe_meta,
+                    "expires_at": expires_at_iso,        
+                    "receipt": {  # 👇 Обязательно при включённой фискализации
+                        "customer": {
+                            "email": "danya.pochta76@gmail.com",  # или phone
                         },
-                        "capture": True,
-                        "description": description,
-                        "metadata": safe_meta,
-                        "expires_at": expires_at_iso,
-                        # можно не дублировать receipt, но лучше оставить как у основного
-                    },
-                    timeout=10.0,
-                )
-                sbp_payment = sbp_resp.json()
-                # confirmation url может быть в sbp_payment["confirmation"]["confirmation_url"]
-                sbp_confirm_url = (sbp_payment.get("confirmation") or {}).get("confirmation_url") or \
-                                  (sbp_payment.get("confirmation") or {}).get("confirmation_url")  # defensive
-                # некоторым шлюзам возвращают поле qr или qr_code
-                sbp_qr = (sbp_payment.get("confirmation") or {}).get("qr") or (sbp_payment.get("confirmation") or {}).get("qr_code")
-            except Exception as e:
-                print("⚠️ Ошибка создания SBP-платежа в YooKassa:", e)
-                sbp_payment = {}
+                        "items": [
+                            {
+                                "description": meta.get("name", "Публикация товара"),
+                                "quantity": "1.00",
+                                "amount": {
+                                    "value": f"{amount:.2f}",
+                                    "currency": "RUB"
+                                },
+                                "vat_code": 1,
+                                "payment_subject": "service",
+                                "payment_mode": "full_payment"  
+                            }
+                        ]
+                    }
+                },
+                timeout=10.0,
+            )
+            yookassa_payment = yookassa_payment.json()
 
-    payment_id = (yookassa_payment or {}).get("id")
-    sbp_payment_id = (sbp_payment or {}).get("id")
-
+    # 🧠 Возвращаем данные для Telegram Bot API
+    payment_id = yookassa_payment.get("id")
+    
     return {
         "success": True,
         "payload": f"order_{order_id}",
@@ -217,16 +151,12 @@ async def create_payment(request: Request):
         "prices": prices,
         "provider_token": os.getenv("TELEGRAM_PROVIDER_TOKEN"),
         "metadata": safe_meta,
+
         "provider_data": {
             "yookassa_payment_id": payment_id
         },
+
         "yookassa_payment_id": payment_id,
-        # Новые поля для фронта/WebApp:
-        "sbp": {
-            "payment_id": sbp_payment_id,
-            "confirm_url": sbp_confirm_url,
-            "qr": sbp_qr
-        }
     }
 
 async def publish_product(product_id: int, max_retries: int = 3):

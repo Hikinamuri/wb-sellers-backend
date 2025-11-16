@@ -77,7 +77,23 @@ async def cancel_yk_payment(payment_id: str) -> tuple[int, str]:
         return (0, str(e))
 
 # ---------- Конец вспомогательных функций ----------
+async def send_payment_button(user_id: int, confirmation_url: str, order_id: str):
+    from telegram import Bot
+    bot = Bot(BOT_TOKEN)
 
+    sent = await bot.send_message(
+        chat_id=user_id,
+        text="💳 Для оплаты нажмите кнопку ниже. Оплата откроется в браузере.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Оплатить", url=confirmation_url)]]
+        ),
+    )
+
+    # Сохраняем соответствие order_id → сообщение, чтобы удалить при отмене/успехе
+    PENDING_MESSAGES[order_id] = {"chat_id": user_id, "message_id": sent.message_id}
+
+    print(f"🟢 Отправлена кнопка оплаты для order_id={order_id}")
+    
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     tg_id = user.id
@@ -188,99 +204,6 @@ async def handle_product_parsing(update: Update, product_url: str):
             "❌ Произошла ошибка при получении информации о товаре"
         )
 
-async def send_payment_menu(user_id: int, amount: float, order_id: str):
-    # используем глобальный BOT, который инициализируется в on_startup
-    global BOT
-    provider_token = os.getenv("TELEGRAM_PROVIDER_TOKEN")
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 Оплата картой", pay=True)],
-        [InlineKeyboardButton("🔵 Оплатить через СБП", callback_data=f"sbp_{order_id}")]
-    ])
-
-    if not BOT:
-        print("⚠️ BOT not ready yet — cannot send invoice")
-        return
-
-    # send_invoice у Bot API
-    await BOT.send_invoice(
-        chat_id=user_id,
-        title="Оплата публикации",
-        description="Размещение вашего товара",
-        payload=f"order_{order_id}",
-        provider_token=provider_token,
-        currency="RUB",
-        prices=[{"label": "Публикация", "amount": int(amount * 100)}],
-        reply_markup=keyboard
-    )
-
-    
-async def handle_sbp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    await query.answer()  # убирает "загружаю..."
-
-    # Получаем order_id
-    _, order_id = query.data.split("_", 1)
-
-    # Если хранишь цену в БД — достань её. Пока — дефолт:
-    amount = 300.0
-
-    # Создаём SBP-платёж на бэкенде
-    sbp_url = None
-    sbp_payment_id = None
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{BACKEND_URL}/api/payments/sbp/create",
-                json={
-                    "amount": amount,
-                    "meta": {"order_id": order_id, "user_id": str(query.from_user.id)}
-                },
-                timeout=10.0
-            ) as resp:
-                if resp.status == 200:
-                    j = await resp.json()
-                    sbp_url = j.get("sbp_url") or j.get("confirm_url") or j.get("url")
-                    sbp_payment_id = j.get("payment_id") or j.get("id")
-                else:
-                    text = await resp.text()
-                    print("⚠️ SBP create returned", resp.status, text)
-    except Exception as e:
-        print("❌ Ошибка создания SBP на бекенде:", e)
-
-    # Ответ пользователю — ссылка на банк + (опционально) QR
-    if sbp_url:
-        # Регистрируем платеж в YK_PENDING, если получили id
-        if sbp_payment_id:
-            YK_PENDING[sbp_payment_id] = {
-                "chat_id": query.from_user.id,
-                "invoice_message_id": query.message.message_id if query.message else None,
-                "created_at": time.time(),
-                "order_id": order_id,
-            }
-
-        try:
-            await query.message.reply_text(
-                "🔵 <b>Оплата через СБП</b>\n\n"
-                "Нажмите кнопку ниже, чтобы открыть приложение банка и завершить оплату:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Открыть банк / продолжить оплату", url=sbp_url)]
-                ])
-            )
-        except Exception as e:
-            print("⚠️ Не удалось отправить сообщение с SBP ссылкой:", e)
-            try:
-                await query.answer(text="Ссылка на оплату: " + sbp_url, show_alert=True)
-            except:
-                pass
-    else:
-        await query.message.reply_text("⚠️ Не удалось сформировать ссылку на СБП. Попробуйте позже.")
-
-    
-    
 def format_api_product_message(product_data: dict) -> str:
     """Форматирование сообщения с реальными данными из API"""
     name = product_data.get('name', 'Неизвестно')
@@ -612,19 +535,8 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             # ==========================
             #  ОТПРАВЛЯЕМ INVOICE
             # ==========================
-            sent = await update.message.reply_invoice(
-                title=data["title"],
-                description=data["description"],
-                payload=payload,
-                provider_token=os.getenv("TELEGRAM_PROVIDER_TOKEN") or "390540012:LIVE:82345",
-                currency=data["currency"],
-                prices=prices,
-                start_parameter="publish",
-                need_name=True,
-                need_email=True,
-                send_email_to_provider=True,
-                provider_data=json.dumps(provider_data, ensure_ascii=False),
-            )
+            sent = await send_payment_button(user_id=int(tg_id), confirmation_url=confirmation_url, order_id=order_id)
+
             
             # --- регистрация YK id, если backend прислал его
             yk_id_from_backend = data.get("yookassa_payment_id")
@@ -1146,8 +1058,6 @@ if __name__ == "__main__":
         app.add_handler(CallbackQueryHandler(month_callback, pattern=r"^month:\d{4}:\d{1,2}$"))
         app.add_handler(CallbackQueryHandler(week_callback, pattern=r"^week:\d{4}:\d{1,2}:\d+$"))
         app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
-        app.add_handler(CallbackQueryHandler(handle_sbp_callback, pattern=r"^sbp_"))
-
         
         print("✅ Бот запущен!")
         logging.basicConfig(level=logging.DEBUG)
