@@ -683,7 +683,7 @@ async def auto_cancel_yookassa_loop():
 
         for pid, info in list(YK_PENDING.items()):
             age = now - info.get("created_at", now)
-            if age >= 30:  # интервал для автo-отмены
+            if age >= 120:  # интервал для автo-отмены
                 print(f"⏳ Auto-cancel: payment {pid} age={age:.1f}s")
 
                 try:

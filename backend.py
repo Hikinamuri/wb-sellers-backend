@@ -25,7 +25,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = "@ekzoskidki" 
 TELEGRAM_PROVIDER_TOKEN=os.getenv("TELEGRAM_PROVIDER_TOKEN")
-YK_PENDING = {}
+PENDING_MESSAGES: dict[str, dict] = {}
+YK_PENDING: dict[str, dict] = {}
 
 bot = Bot(token=BOT_TOKEN)
 
@@ -449,7 +450,7 @@ async def get_user_products(tg_id: str, session: AsyncSession = Depends(get_sess
 async def yookassa_callback(request: Request):
     payload = await request.json()
     event = payload.get("event")
-    obj = payload.get("object", {})  
+    obj = payload.get("object", {})
 
     print("💳 YooKassa callback:", event)
     print("💳 CALLBACK RAW:", json.dumps(payload, ensure_ascii=False))
@@ -459,46 +460,45 @@ async def yookassa_callback(request: Request):
     order_id = metadata.get("order_id")
     pid = obj.get("id")
 
+    bot = Bot(BOT_TOKEN)  # создаём один раз
+
     # ==== Обработка отмены платежа ====
     if event == "payment.canceled":
-        if pid and pid in YK_PENDING:
+        if pid:
             YK_PENDING.pop(pid, None)
             print(f"🚫 YooKassa callback removed pending payment {pid}")
 
         if user_id:
             try:
-                bot = Bot(BOT_TOKEN)
                 await bot.send_message(
                     chat_id=int(user_id),
                     text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
                     parse_mode="HTML"
                 )
-
-                # Удаляем сообщение с кнопкой оплаты, если есть
-                if order_id and order_id in PENDING_MESSAGES:
-                    info = PENDING_MESSAGES.pop(order_id, None)
-                    if info:
-                        try:
-                            await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
-                        except Exception:
-                            pass
-
             except Exception as e:
-                print("Ошибка отправки пользователю:", e)
+                print("⚠️ Ошибка отправки пользователю:", e)
+
+        # удаляем сообщение с кнопкой оплаты, если есть
+        if order_id and order_id in PENDING_MESSAGES:
+            info = PENDING_MESSAGES.pop(order_id, None)
+            if info:
+                try:
+                    await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
+                except Exception as e:
+                    print("⚠️ Ошибка удаления pending message:", e)
 
         return {"success": True}
 
     # ==== Обработка успешной оплаты ====
     if event in ("payment.succeeded", "payment.captured", "payment.paid"):
         print(f"✅ Payment succeeded for id={pid}")
-        # убираем из ожиданий
-        if pid and pid in YK_PENDING:
+
+        if pid:
             YK_PENDING.pop(pid, None)
 
         # уведомляем пользователя
         if user_id:
             try:
-                bot = Bot(BOT_TOKEN)
                 await bot.send_message(
                     chat_id=int(user_id),
                     text="✅ <b>Оплата получена</b>\nДобавляю товар в очередь на выкладку...",
@@ -512,18 +512,17 @@ async def yookassa_callback(request: Request):
             info = PENDING_MESSAGES.pop(order_id, None)
             if info:
                 try:
-                    bot = Bot(BOT_TOKEN)
                     await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
                 except Exception as e:
                     print("⚠️ Ошибка удаления pending message:", e)
 
-        # добавляем товар в базу (асинхронно, чтобы быстро ответить webhook)
+        # добавляем товар в базу асинхронно
         if metadata:
             try:
                 import asyncio
                 asyncio.create_task(
                     add_product_to_db(
-                        user_id=str(metadata.get("user_id") or metadata.get("tg_id")),
+                        user_id=str(user_id),
                         url=metadata.get("url"),
                         name=metadata.get("name"),
                         description=metadata.get("description") or "",
@@ -540,7 +539,6 @@ async def yookassa_callback(request: Request):
 
     # по умолчанию отвечаем успехом — чтобы YooKassa не повторяла
     return {"success": True}
-
 
 
 async def add_product_to_db(
