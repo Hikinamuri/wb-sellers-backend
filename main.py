@@ -339,8 +339,8 @@ async def cancel_all_pending_invoices(context, chat_id):
 async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_seconds: int = 25, reason_msg: str = None):
     await asyncio.sleep(delay_seconds)
     
-    if pid in PROCESSED_PAYMENTS:
-        print(f"⚠️ Payment {pid} already processed, skipping cancel")
+    if payment_id in PROCESSED_PAYMENTS:
+        print(f"⚠️ Payment {payment_id } already processed, skipping cancel")
         return
 
 
@@ -728,7 +728,7 @@ async def auto_cancel_yookassa_loop():
         expired = []
 
         # копируем ключи, чтобы не итерировать и не модифицировать одновременно
-        for pid, info in list(YK_PENDING.items()):
+        for payment_id , info in list(YK_PENDING.items()):
             try:
                 age = now - info.get("created_at", now)
                 # жёстко увеличим порог до 120s или возьми env
@@ -736,17 +736,17 @@ async def auto_cancel_yookassa_loop():
                     continue
 
                 # перепроверим реальный статус у YooKassa
-                yk_info = await fetch_yk_payment(pid)
+                yk_info = await fetch_yk_payment(payment_id )
                 if not yk_info:
-                    print(f"ℹ️ auto_cancel: не удалось fetch yk {pid}, пропускаем")
+                    print(f"ℹ️ auto_cancel: не удалось fetch yk {payment_id }, пропускаем")
                     continue
                 status = yk_info.get("status")
-                print(f"ℹ️ auto_cancel: status for {pid} = {status} (age={age:.1f}s)")
+                print(f"ℹ️ auto_cancel: status for {payment_id } = {status} (age={age:.1f}s)")
 
                 # отменяем только если реально в pending
                 if status in ("pending", "waiting_for_capture"):
-                    code, text = await cancel_yk_payment(pid)
-                    print(f"🗑 YK cancel {pid} → {code} {text}")
+                    code, text = await cancel_yk_payment(payment_id )
+                    print(f"🗑 YK cancel {payment_id } → {code} {text}")
 
                     # уведомим пользователя
                     try:
@@ -766,19 +766,19 @@ async def auto_cancel_yookassa_loop():
                     except Exception as e:
                         print("⚠️ Ошибка при удалении invoice message после автo-отмены:", e)
 
-                    PROCESSED_PAYMENTS[pid] = {"status": "canceled", "ts": time.time()}
-                    expired.append(pid)
+                    PROCESSED_PAYMENTS[payment_id ] = {"status": "canceled", "ts": time.time()}
+                    expired.append(payment_id )
                 else:
                     # если уже succeeded/captured — просто убираем pending и не шлём cancel уведомление
                     if status in ("succeeded", "captured"):
-                        print(f"✅ auto_cancel: {pid} уже {status} — убираем из очереди")
-                        expired.append(pid)
+                        print(f"✅ auto_cancel: {payment_id } уже {status} — убираем из очереди")
+                        expired.append(payment_id )
 
             except Exception as e:
-                print("⚠️ Ошибка в auto_cancel loop при обработке", pid, e)
+                print("⚠️ Ошибка в auto_cancel loop при обработке", payment_id , e)
 
-        for pid in expired:
-            YK_PENDING.pop(pid, None)
+        for payment_id  in expired:
+            YK_PENDING.pop(payment_id , None)
 
         await asyncio.sleep(5)
 async def on_startup(application):
