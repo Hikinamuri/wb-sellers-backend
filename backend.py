@@ -18,6 +18,8 @@ from database.models import Product, User, ProductStatus
 from backend.new_parser import parse_wb_product_api
 import html  
 from dotenv import load_dotenv
+import time
+
 
 
 load_dotenv()

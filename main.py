@@ -40,6 +40,7 @@ YOOKASSA_ACCOUNT = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_SECRET = os.getenv("YOOKASSA_SECRET_KEY")
 YK_PENDING = {}
 BOT = None
+PROCESSED_PAYMENTS: dict[str, dict] = {}
 
 # Порог возраста YK-платежа (в секундах), старше которого мы пытаемся отменить чтобы избежать duplicate.
 YK_AGE_CANCEL_THRESHOLD = int(os.getenv("YK_AGE_CANCEL_THRESHOLD", "60"))  # дефолт 60s
@@ -337,6 +338,12 @@ async def cancel_all_pending_invoices(context, chat_id):
   
 async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_seconds: int = 25, reason_msg: str = None):
     await asyncio.sleep(delay_seconds)
+    
+    if pid in PROCESSED_PAYMENTS:
+        print(f"⚠️ Payment {pid} already processed, skipping cancel")
+        return
+
+
     try:
         # если уже обработан как succeeded — не трогаем
         pinfo = PROCESSED_PAYMENTS.get(payment_id)
