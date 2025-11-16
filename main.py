@@ -39,6 +39,7 @@ parsing_cache = {}
 YOOKASSA_ACCOUNT = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_SECRET = os.getenv("YOOKASSA_SECRET_KEY")
 YK_PENDING = {}
+BOT = None
 
 # Порог возраста YK-платежа (в секундах), старше которого мы пытаемся отменить чтобы избежать duplicate.
 YK_AGE_CANCEL_THRESHOLD = int(os.getenv("YK_AGE_CANCEL_THRESHOLD", "60"))  # дефолт 60s
@@ -187,6 +188,99 @@ async def handle_product_parsing(update: Update, product_url: str):
             "❌ Произошла ошибка при получении информации о товаре"
         )
 
+async def send_payment_menu(user_id: int, amount: float, order_id: str):
+    # используем глобальный BOT, который инициализируется в on_startup
+    global BOT
+    provider_token = os.getenv("TELEGRAM_PROVIDER_TOKEN")
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Оплата картой", pay=True)],
+        [InlineKeyboardButton("🔵 Оплатить через СБП", callback_data=f"sbp_{order_id}")]
+    ])
+
+    if not BOT:
+        print("⚠️ BOT not ready yet — cannot send invoice")
+        return
+
+    # send_invoice у Bot API
+    await BOT.send_invoice(
+        chat_id=user_id,
+        title="Оплата публикации",
+        description="Размещение вашего товара",
+        payload=f"order_{order_id}",
+        provider_token=provider_token,
+        currency="RUB",
+        prices=[{"label": "Публикация", "amount": int(amount * 100)}],
+        reply_markup=keyboard
+    )
+
+    
+async def handle_sbp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()  # убирает "загружаю..."
+
+    # Получаем order_id
+    _, order_id = query.data.split("_", 1)
+
+    # Если хранишь цену в БД — достань её. Пока — дефолт:
+    amount = 300.0
+
+    # Создаём SBP-платёж на бэкенде
+    sbp_url = None
+    sbp_payment_id = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{BACKEND_URL}/api/payments/sbp/create",
+                json={
+                    "amount": amount,
+                    "meta": {"order_id": order_id, "user_id": str(query.from_user.id)}
+                },
+                timeout=10.0
+            ) as resp:
+                if resp.status == 200:
+                    j = await resp.json()
+                    sbp_url = j.get("sbp_url") or j.get("confirm_url") or j.get("url")
+                    sbp_payment_id = j.get("payment_id") or j.get("id")
+                else:
+                    text = await resp.text()
+                    print("⚠️ SBP create returned", resp.status, text)
+    except Exception as e:
+        print("❌ Ошибка создания SBP на бекенде:", e)
+
+    # Ответ пользователю — ссылка на банк + (опционально) QR
+    if sbp_url:
+        # Регистрируем платеж в YK_PENDING, если получили id
+        if sbp_payment_id:
+            YK_PENDING[sbp_payment_id] = {
+                "chat_id": query.from_user.id,
+                "invoice_message_id": query.message.message_id if query.message else None,
+                "created_at": time.time(),
+                "order_id": order_id,
+            }
+
+        try:
+            await query.message.reply_text(
+                "🔵 <b>Оплата через СБП</b>\n\n"
+                "Нажмите кнопку ниже, чтобы открыть приложение банка и завершить оплату:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Открыть банк / продолжить оплату", url=sbp_url)]
+                ])
+            )
+        except Exception as e:
+            print("⚠️ Не удалось отправить сообщение с SBP ссылкой:", e)
+            try:
+                await query.answer(text="Ссылка на оплату: " + sbp_url, show_alert=True)
+            except:
+                pass
+    else:
+        await query.message.reply_text("⚠️ Не удалось сформировать ссылку на СБП. Попробуйте позже.")
+
+    
+    
 def format_api_product_message(product_data: dict) -> str:
     """Форматирование сообщения с реальными данными из API"""
     name = product_data.get('name', 'Неизвестно')
@@ -325,7 +419,7 @@ async def cancel_all_pending_invoices(context, chat_id):
     for payload in to_remove:
         SENT_INVOICES.pop(payload, None)
   
-async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_seconds: int = 10, reason_msg: str = None):
+async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_seconds: int = 25, reason_msg: str = None):
     await asyncio.sleep(delay_seconds)
     try:
         yk = await fetch_yk_payment(payment_id)
@@ -337,15 +431,38 @@ async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_secon
         if status in ("pending", "waiting_for_capture"):
             code, text = await cancel_yk_payment(payment_id)
             print(f"🗑 Auto-cancel attempt for {payment_id} -> {code} {text}")
-            # уведомим пользователя (если надо)
+
+            # уведомим пользователя и почистим локальные структуры
             try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова."),
-                    parse_mode="HTML"
-                )
+                global BOT
+                if BOT:
+                    await BOT.send_message(
+                        chat_id=chat_id,
+                        text=(reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова."),
+                        parse_mode="HTML"
+                    )
             except Exception as e:
                 print("Ошибка отправки сообщения после автo-отмены:", e)
+
+            # убираем из YK_PENDING (если ещё есть)
+            YK_PENDING.pop(payment_id, None)
+
+            # удалим запись в SENT_INVOICES и PENDING_MESSAGES, если нашли по message_id
+            try:
+                # ищем invoice message id, если он был сохранён в YK_PENDING ранее
+                # иногда в YK_PENDING у нас хранится 'invoice_message_id'
+                # попытаемся удалить все SENT_INVOICES, где message_id совпадает
+                to_remove_payloads = []
+                for payload, info in list(SENT_INVOICES.items()):
+                    if info.get("message_id") == (yk.get("metadata", {}) or {}).get("invoice_message_id") or info.get("chat_id") == chat_id:
+                        # осторожно: удаляем только если совпадают chat_id (чтобы не сломать другие)
+                        if info.get("chat_id") == chat_id:
+                            to_remove_payloads.append(payload)
+                for p in to_remove_payloads:
+                    SENT_INVOICES.pop(p, None)
+            except Exception:
+                pass
+
     except Exception as e:
         print("Ошибка maybe_cancel_yk_after_delay:", e)
 
@@ -518,7 +635,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "created_at": time.time(),
                 }
                 # на всякий случай — запустим кратковременную отложенную проверку (не обязателно)
-                asyncio.create_task(maybe_cancel_yk_after_delay(yk_id_from_backend, update.effective_chat.id, delay_seconds=8))
+                asyncio.create_task(maybe_cancel_yk_after_delay(yk_id_from_backend, update.effective_chat.id, delay_seconds=25))
                 print(f"🧾 Registered pending yk id from backend: {yk_id_from_backend}")
 
 
@@ -535,6 +652,16 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             }
 
             PENDING_MESSAGES[raw_key] = info
+            SENT_INVOICES[payload] = info
+            
+            # если в metadata пришёл order_id — сохраним и по нему, чтобы backend мог удалить сообщение по order_id
+            try:
+                order_id_from_meta = (pending_meta or {}).get("order_id") or data.get("metadata", {}).get("order_id")
+                if order_id_from_meta:
+                    PENDING_MESSAGES[order_id_from_meta] = info
+            except Exception:
+                pass
+
             SENT_INVOICES[payload] = info
 
             print(f"✅ Sent invoice. payload={payload} chat={info['chat_id']} msg={info['message_id']}")
@@ -656,7 +783,7 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
 
-    yk_id = query.provider_payment_charge_id  # id юкассы присланный Telegram в precheckout
+    yk_id = None
     payload = query.invoice_payload
     chat_id = query.from_user.id
 
@@ -680,7 +807,7 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             maybe_cancel_yk_after_delay(
                 payment_id=yk_id,
                 chat_id=chat_id,
-                delay_seconds=8,
+                delay_seconds=40,
                 reason_msg="⛔️ Оплата не была подтверждена. Попробуйте ещё раз."
             )
         )
@@ -690,14 +817,14 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     
 async def auto_cancel_yookassa_loop():
     """Фоновая задача: проверяет платежи и отменяет старые через ~8 сек."""
+    global BOT
     while True:
         now = time.time()
         expired = []
 
-        for pid, info in YK_PENDING.items():
-            age = now - info["created_at"]
-
-            if age >= 8:   # скорость вручную регулируется здесь
+        for pid, info in list(YK_PENDING.items()):
+            age = now - info.get("created_at", now)
+            if age >= 20:   # интервал для автo-отмены
                 print(f"⏳ Auto-cancel: payment {pid} age={age:.1f}s")
 
                 # --- отмена в ЮKassa
@@ -706,31 +833,38 @@ async def auto_cancel_yookassa_loop():
 
                 # --- уведомляем пользователя
                 try:
-                    await bot.send_message(
-                        chat_id=info["chat_id"],
-                        text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
-                        parse_mode="HTML"
-                    )
-                except: pass
+                    if BOT:
+                        await BOT.send_message(
+                            chat_id=info["chat_id"],
+                            text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
+                            parse_mode="HTML"
+                        )
+                except Exception as e:
+                    print("⚠️ Ошибка при отправке уведомления после автo-отмены:", e)
 
-                # --- удаляем invoice
+                # --- удаляем invoice сообщение (если известно)
                 try:
-                    await bot.delete_message(
-                        chat_id=info["chat_id"],
-                        message_id=info["invoice_message_id"]
-                    )
-                except: pass
+                    if info.get("invoice_message_id"):
+                        if BOT:
+                            await BOT.delete_message(chat_id=info["chat_id"], message_id=info["invoice_message_id"])
+                except Exception as e:
+                    print("⚠️ Ошибка при удалении invoice message после автo-отмены:", e)
 
                 expired.append(pid)
 
         for pid in expired:
             YK_PENDING.pop(pid, None)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)  # частота цикла: 1 сек (можно увеличить)
 
-async def on_startup(app):
+async def on_startup(application):
+    global BOT
+    # application — это Application из python-telegram-bot; у него есть .bot
+    BOT = application.bot
+    # запускаем цикл авто-отмен
     asyncio.create_task(auto_cancel_yookassa_loop())
-    print("🚀 Auto-cancel loop started")
+    print("🚀 Auto-cancel loop started — bot attached")
+
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
@@ -1012,6 +1146,8 @@ if __name__ == "__main__":
         app.add_handler(CallbackQueryHandler(month_callback, pattern=r"^month:\d{4}:\d{1,2}$"))
         app.add_handler(CallbackQueryHandler(week_callback, pattern=r"^week:\d{4}:\d{1,2}:\d+$"))
         app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+        app.add_handler(CallbackQueryHandler(handle_sbp_callback, pattern=r"^sbp_"))
+
         
         print("✅ Бот запущен!")
         logging.basicConfig(level=logging.DEBUG)
