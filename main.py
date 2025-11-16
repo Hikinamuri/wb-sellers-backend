@@ -339,48 +339,29 @@ async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_secon
     await asyncio.sleep(delay_seconds)
     try:
         yk = await fetch_yk_payment(payment_id)
-        if not yk:
-            print(f"ℹ️ cannot fetch yk payment {payment_id} after delay")
-            return
-        status = yk.get("status")
-        print(f"ℹ️ Post-delay YooKassa status for {payment_id}: {status}")
+        status = yk.get("status") if yk else None
+
         if status in ("pending", "waiting_for_capture"):
             code, text = await cancel_yk_payment(payment_id)
-            print(f"🗑 Auto-cancel attempt for {payment_id} -> {code} {text}")
+            print(f"🗑 Delayed cancel {payment_id} -> {code} {text}")
 
-            # уведомим пользователя и почистим локальные структуры
-            try:
-                global BOT
-                if BOT:
-                    await BOT.send_message(
-                        chat_id=chat_id,
-                        text=(reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова."),
-                        parse_mode="HTML"
-                    )
-            except Exception as e:
-                print("Ошибка отправки сообщения после автo-отмены:", e)
+            if BOT:
+                await BOT.send_message(
+                    chat_id=chat_id,
+                    text=reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова.",
+                    parse_mode="HTML"
+                )
 
-            # убираем из YK_PENDING (если ещё есть)
+        elif status in ("succeeded", "captured"):
+            print(f"✅ Delayed check: платеж {payment_id} уже успешен, не отменяем")
             YK_PENDING.pop(payment_id, None)
 
-            # удалим запись в SENT_INVOICES и PENDING_MESSAGES, если нашли по message_id
-            try:
-                # ищем invoice message id, если он был сохранён в YK_PENDING ранее
-                # иногда в YK_PENDING у нас хранится 'invoice_message_id'
-                # попытаемся удалить все SENT_INVOICES, где message_id совпадает
-                to_remove_payloads = []
-                for payload, info in list(SENT_INVOICES.items()):
-                    if info.get("message_id") == (yk.get("metadata", {}) or {}).get("invoice_message_id") or info.get("chat_id") == chat_id:
-                        # осторожно: удаляем только если совпадают chat_id (чтобы не сломать другие)
-                        if info.get("chat_id") == chat_id:
-                            to_remove_payloads.append(payload)
-                for p in to_remove_payloads:
-                    SENT_INVOICES.pop(p, None)
-            except Exception:
-                pass
+        else:
+            print(f"⚠️ Delayed check: неожиданный статус {status} для {payment_id}")
 
     except Exception as e:
         print("Ошибка maybe_cancel_yk_after_delay:", e)
+
 
 
 async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -694,7 +675,7 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     
 async def auto_cancel_yookassa_loop():
-    """Фоновая задача: проверяет платежи и отменяет старые через ~8 сек."""
+    """Фоновая задача: проверяет платежи и отменяет старые через ~20 сек."""
     global BOT
     while True:
         now = time.time()
@@ -702,38 +683,43 @@ async def auto_cancel_yookassa_loop():
 
         for pid, info in list(YK_PENDING.items()):
             age = now - info.get("created_at", now)
-            if age >= 20:   # интервал для автo-отмены
+            if age >= 30:  # интервал для автo-отмены
                 print(f"⏳ Auto-cancel: payment {pid} age={age:.1f}s")
 
-                # --- отмена в ЮKassa
-                code, text = await cancel_yk_payment(pid)
-                print(f"🗑 YK cancel {pid} → {code} {text}")
-
-                # --- уведомляем пользователя
                 try:
-                    if BOT:
-                        await BOT.send_message(
-                            chat_id=info["chat_id"],
-                            text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
-                            parse_mode="HTML"
-                        )
-                except Exception as e:
-                    print("⚠️ Ошибка при отправке уведомления после автo-отмены:", e)
+                    yk_info = await fetch_yk_payment(pid)
+                    status = yk_info.get("status") if yk_info else None
 
-                # --- удаляем invoice сообщение (если известно)
-                try:
-                    if info.get("invoice_message_id"):
+                    if status in ("pending", "waiting_for_capture"):
+                        code, text = await cancel_yk_payment(pid)
+                        print(f"🗑 YK cancel {pid} → {code} {text}")
+
+                        # уведомляем пользователя
                         if BOT:
-                            await BOT.delete_message(chat_id=info["chat_id"], message_id=info["invoice_message_id"])
-                except Exception as e:
-                    print("⚠️ Ошибка при удалении invoice message после автo-отмены:", e)
+                            await BOT.send_message(
+                                chat_id=info["chat_id"],
+                                text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
+                                parse_mode="HTML"
+                            )
 
-                expired.append(pid)
+                        # удаляем invoice сообщение
+                        if info.get("invoice_message_id") and BOT:
+                            await BOT.delete_message(chat_id=info["chat_id"], message_id=info["invoice_message_id"])
+
+                    elif status in ("succeeded", "captured"):
+                        print(f"✅ Оплата {pid} уже успешна, не отменяем")
+                        expired.append(pid)  # удаляем из YK_PENDING
+
+                    else:
+                        print(f"⚠️ Статус {pid} неожиданный: {status}")
+
+                except Exception as e:
+                    print(f"⚠️ Ошибка при проверке/отмене платежа {pid}: {e}")
 
         for pid in expired:
             YK_PENDING.pop(pid, None)
 
-        await asyncio.sleep(1)  # частота цикла: 1 сек (можно увеличить)
+        await asyncio.sleep(1)
 
 async def on_startup(application):
     global BOT
@@ -742,7 +728,6 @@ async def on_startup(application):
     # запускаем цикл авто-отмен
     asyncio.create_task(auto_cancel_yookassa_loop())
     print("🚀 Auto-cancel loop started — bot attached")
-
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
@@ -756,7 +741,7 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             print(f"🔎 Matched sent invoice: {sent}")
             # можно дополнительно проверить возраст инвойса
             age = int(time.time()) - sent["ts"]
-            if age > 60 * 15:  # 15 минут
+            if age > 60 * 11:  # 15 минут
                 print("⚠️ Invoice older than 15min, rejecting precheckout to force new flow.")
                 await query.answer(ok=False, error_message="Срок формы оплаты истёк — откройте форму снова.")
                 return
@@ -890,7 +875,6 @@ async def month_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-
 async def week_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -933,8 +917,6 @@ async def week_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(msg, parse_mode="HTML", reply_markup=kb)
 
-
-# --- Сегодня ---
 async def stats_today_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика за сегодняшний день"""
     query = update.callback_query
@@ -964,7 +946,6 @@ async def stats_today_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     ])
 
     await query.edit_message_text(msg, parse_mode="HTML", reply_markup=kb)
-
 
 async def debug_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -996,7 +977,6 @@ async def debug_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
         
-
 async def remove_webhook_before_start(application):
     await application.bot.delete_webhook(drop_pending_updates=True)
 
