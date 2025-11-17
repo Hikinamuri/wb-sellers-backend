@@ -492,35 +492,35 @@ async def yookassa_callback(request: Request):
 
 
     # ==== Обработка отмены платежа ====
-    if event == "payment.canceled":
-        if pid in PROCESSED_PAYMENTS and PROCESSED_PAYMENTS[pid]["status"] == "succeeded":
-            print(f"⚠️ Payment {pid} already succeeded, ignoring cancellation")
-            return {"success": True}
-        # если мы уже обрабатывали succeeded — выше вернули True
-        YK_PENDING.pop(pid, None)
-        PROCESSED_PAYMENTS[pid] = {"status": "canceled", "ts": time.time()}
-        print(f"🚫 YooKassa callback marked payment canceled {pid}")
+    # if event == "payment.canceled":
+    #     if pid in PROCESSED_PAYMENTS and PROCESSED_PAYMENTS[pid]["status"] == "succeeded":
+    #         print(f"⚠️ Payment {pid} already succeeded, ignoring cancellation")
+    #         return {"success": True}
+    #     # если мы уже обрабатывали succeeded — выше вернули True
+    #     YK_PENDING.pop(pid, None)
+    #     PROCESSED_PAYMENTS[pid] = {"status": "canceled", "ts": time.time()}
+    #     print(f"🚫 YooKassa callback marked payment canceled {pid}")
 
-        if user_id:
-            try:
-                await bot.send_message(
-                    chat_id=int(user_id),
-                    text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                print("Ошибка отправки пользователю (canceled):", e)
+    #     if user_id:
+    #         try:
+    #             await bot.send_message(
+    #                 chat_id=int(user_id),
+    #                 text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
+    #                 parse_mode="HTML"
+    #             )
+    #         except Exception as e:
+    #             print("Ошибка отправки пользователю (canceled):", e)
 
-        # удаляем кнопку оплаты если есть
-        if order_id and order_id in PENDING_MESSAGES:
-            info = PENDING_MESSAGES.pop(order_id, None)
-            if info:
-                try:
-                    await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
-                except Exception:
-                    pass
+    #     # удаляем кнопку оплаты если есть
+    #     if order_id and order_id in PENDING_MESSAGES:
+    #         info = PENDING_MESSAGES.pop(order_id, None)
+    #         if info:
+    #             try:
+    #                 await bot.delete_message(chat_id=info["chat_id"], message_id=info["message_id"])
+    #             except Exception:
+    #                 pass
 
-        return {"success": True}
+    #     return {"success": True}
 
     # ==== Обработка успешной оплаты ====
     if event in ("payment.succeeded", "payment.captured", "payment.paid"):

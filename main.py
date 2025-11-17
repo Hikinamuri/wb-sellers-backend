@@ -19,8 +19,8 @@ import logging
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-WEB_APP_URL = "https://wb-seller.vercel.app/"
-# WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
+# WEB_APP_URL = "https://wb-seller.vercel.app/"
+WEB_APP_URL = "https://wb-miniapp-demo.loca.lt"
 # BACKEND_URL = "http://localhost:8000"
 BACKEND_URL = "https://api.hikinamuri.ru"
 SUPPORT_USERNAME = "@ekzoskidki7"
@@ -384,12 +384,12 @@ async def maybe_cancel_yk_after_delay(payment_id: str, chat_id: int, delay_secon
             if pending:
                 try:
                     global BOT
-                    if BOT:
-                        await BOT.send_message(
-                            chat_id=pending.get("chat_id"),
-                            text=(reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова."),
-                            parse_mode="HTML"
-                        )
+                    # if BOT:
+                    #     await BOT.send_message(
+                    #         chat_id=pending.get("chat_id"),
+                    #         text=(reason_msg or "⛔ <b>Оплата отменена</b>\nЕсли вы закрыли форму — попробуйте снова."),
+                    #         parse_mode="HTML"
+                    #     )
                 except Exception as e:
                     print("Ошибка отправки сообщения после автo-отмены:", e)
 
@@ -548,7 +548,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
                         "created_at": time.time(),
                         "order_id": order_id,
                     }
-                    asyncio.create_task(maybe_cancel_yk_after_delay(yk_id_from_backend, int(tg_id), delay_seconds=25))
+                    # asyncio.create_task(maybe_cancel_yk_after_delay(yk_id_from_backend, int(tg_id), delay_seconds=25))
                     print(f"🧾 Registered pending yk id from backend: {yk_id_from_backend}")
 
                 # регистрируем PENDING_MESSAGES по order_id
@@ -701,11 +701,11 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if yk_id:
         # регистрируем в глобальной очереди
-        YK_PENDING[yk_id] = {
-            "chat_id": chat_id,
-            "invoice_message_id": invoice_msg_id,
-            "created_at": time.time(),
-        }
+        # YK_PENDING[yk_id] = {
+        #     "chat_id": chat_id,
+        #     "invoice_message_id": invoice_msg_id,
+        #     "created_at": time.time(),
+        # }
         print(f"🧾 Registered pending yk id from precheckout: {yk_id} -> msg={invoice_msg_id}")
 
         # (опционально) создаём кратковременную задачу-страховку
@@ -751,11 +751,11 @@ async def auto_cancel_yookassa_loop():
                     # уведомим пользователя
                     try:
                         if BOT:
-                            await BOT.send_message(
-                                chat_id=info["chat_id"],
-                                text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
-                                parse_mode="HTML"
-                            )
+                            # await BOT.send_message(
+                            #     chat_id=info["chat_id"],
+                            #     text="⛔ <b>Оплата отменена</b>\nВы можете попробовать снова.",
+                            #     parse_mode="HTML"
+                            # )
                     except Exception as e:
                         print("⚠️ Ошибка при отправке уведомления после автo-отмены:", e)
 
@@ -786,7 +786,7 @@ async def on_startup(application):
     # application — это Application из python-telegram-bot; у него есть .bot
     BOT = application.bot
     # запускаем цикл авто-отмен
-    asyncio.create_task(auto_cancel_yookassa_loop())
+    # asyncio.create_task(auto_cancel_yookassa_loop())
     print("🚀 Auto-cancel loop started — bot attached")
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
