@@ -544,7 +544,7 @@ async def yookassa_callback(request: Request):
             try:
                 await bot.send_message(
                     chat_id=int(user_id),
-                    text="✅ <b>Оплата получена</b>\nДобавляю товар в очередь на выкладку...",
+                    text="✅ <b>Оплата получена</b>\nТовар добавлен в очередь на выкладку.",
                     parse_mode="HTML"
                 )
             except Exception as e:
